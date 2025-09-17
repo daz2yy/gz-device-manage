@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>前端API测试</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .test-section { margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
+        button { padding: 10px 15px; margin: 5px; cursor: pointer; }
+        .success { color: green; }
+        .error { color: red; }
+        .info { color: blue; }
+        pre { background: #f5f5f5; padding: 10px; border-radius: 3px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>🔍 前端API连通性测试</h1>
+    
+    <div class="test-section">
+        <h3>1. 用户登录</h3>
+        <button onclick="testLogin()">测试登录</button>
+        <div id="login-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h3>2. 获取设备统计</h3>
+        <button onclick="testStats()">获取统计</button>
+        <div id="stats-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h3>3. 设备扫描</h3>
+        <button onclick="testScan()">扫描设备</button>
+        <div id="scan-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h3>4. 获取设备列表</h3>
+        <button onclick="testDevices()">获取设备</button>
+        <div id="devices-result"></div>
+    </div>
+
+    <script>
+        let authToken = '';
+        
+        function log(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            const className = type === 'success' ? 'success' : type === 'error' ? 'error' : 'info';
+            element.innerHTML = `<div class="${className}">${message}</div>`;
+        }
+        
+        function logJson(elementId, data, type = 'info') {
+            const element = document.getElementById(elementId);
+            const className = type === 'success' ? 'success' : type === 'error' ? 'error' : 'info';
+            element.innerHTML = `<div class="${className}"><pre>${JSON.stringify(data, null, 2)}</pre></div>`;
+        }
+        
+        async function testLogin() {
+            try {
+                log('login-result', '正在登录...', 'info');
+                
+                const formData = new FormData();
+                formData.append('username', 'admin');
+                formData.append('password', 'admin123');
+                
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    authToken = data.access_token;
+                    localStorage.setItem('token', authToken);
+                    logJson('login-result', { message: '登录成功', token: authToken.substring(0, 20) + '...' }, 'success');
+                } else {
+                    logJson('login-result', { error: '登录失败', details: data }, 'error');
+                }
+            } catch (error) {
+                log('login-result', `登录错误: ${error.message}`, 'error');
+            }
+        }
+        
+        async function testStats() {
+            try {
+                log('stats-result', '获取统计中...', 'info');
+                
+                const response = await fetch('/api/devices/stats', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken || localStorage.getItem('token')}`
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    logJson('stats-result', data, 'success');
+                } else {
+                    logJson('stats-result', { error: '获取统计失败', details: data }, 'error');
+                }
+            } catch (error) {
+                log('stats-result', `统计错误: ${error.message}`, 'error');
+            }
+        }
+        
+        async function testScan() {
+            try {
+                log('scan-result', '扫描设备中...', 'info');
+                
+                const response = await fetch('/api/devices/scan', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${authToken || localStorage.getItem('token')}`
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    logJson('scan-result', data, 'success');
+                } else {
+                    logJson('scan-result', { error: '扫描失败', details: data }, 'error');
+                }
+            } catch (error) {
+                log('scan-result', `扫描错误: ${error.message}`, 'error');
+            }
+        }
+        
+        async function testDevices() {
+            try {
+                log('devices-result', '获取设备列表中...', 'info');
+                
+                const response = await fetch('/api/devices', {
+                    headers: {
+                        'Authorization': `Bearer ${authToken || localStorage.getItem('token')}`
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    logJson('devices-result', { 
+                        message: `找到 ${data.length} 个设备`, 
+                        devices: data.map(d => ({ id: d.device_id, type: d.device_type, status: d.status }))
+                    }, 'success');
+                } else {
+                    logJson('devices-result', { error: '获取设备失败', details: data }, 'error');
+                }
+            } catch (error) {
+                log('devices-result', `设备错误: ${error.message}`, 'error');
+            }
+        }
+        
+        // 页面加载时检查是否有保存的token
+        window.onload = function() {
+            const savedToken = localStorage.getItem('token');
+            if (savedToken) {
+                authToken = savedToken;
+                log('login-result', '发现已保存的认证token', 'success');
+            }
+        }
+    </script>
+</body>
+</html>
