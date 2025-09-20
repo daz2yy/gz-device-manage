@@ -150,7 +150,7 @@
 </template>
 
 <script>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { User, Refresh } from '@element-plus/icons-vue'
 import { deviceAPI } from '../api.js'
@@ -163,6 +163,8 @@ export default {
     const recentActivity = ref([])
     const loading = ref(false)
     const activityLoading = ref(false)
+    let websocketRefreshTimeout
+    let unsubscribeFromDeviceUpdates
     
     const userStats = ref({
       occupied_devices: 0,
@@ -321,6 +323,26 @@ export default {
     onMounted(() => {
       loadOccupiedDevices()
       loadRecentActivity()
+      store.connectWebSocket()
+
+      unsubscribeFromDeviceUpdates = store.onDeviceUpdate(() => {
+        if (websocketRefreshTimeout) return
+        websocketRefreshTimeout = setTimeout(() => {
+          loadOccupiedDevices()
+          loadRecentActivity()
+          websocketRefreshTimeout = null
+        }, 500)
+      })
+    })
+
+    onUnmounted(() => {
+      if (unsubscribeFromDeviceUpdates) {
+        unsubscribeFromDeviceUpdates()
+      }
+      if (websocketRefreshTimeout) {
+        clearTimeout(websocketRefreshTimeout)
+        websocketRefreshTimeout = null
+      }
     })
     
     return {

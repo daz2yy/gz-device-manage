@@ -269,22 +269,40 @@ export default {
     
     // Auto refresh
     let refreshInterval
+    let websocketRefreshTimeout
+    let unsubscribeFromDeviceUpdates
     
     onMounted(() => {
       loadStats()
       loadRecentDevices()
       
-      // Connect WebSocket
+      // Ensure WebSocket connection is active
       store.connectWebSocket()
-      
-      // Auto refresh every 30 seconds
+
+      unsubscribeFromDeviceUpdates = store.onDeviceUpdate(() => {
+        if (websocketRefreshTimeout) return
+        websocketRefreshTimeout = setTimeout(() => {
+          loadStats()
+          loadRecentDevices()
+          websocketRefreshTimeout = null
+        }, 500)
+      })
+
+      // Auto refresh every 30 seconds as a fallback
       refreshInterval = setInterval(() => {
         loadStats()
         loadRecentDevices()
       }, 30000)
     })
-    
+
     onUnmounted(() => {
+      if (unsubscribeFromDeviceUpdates) {
+        unsubscribeFromDeviceUpdates()
+      }
+      if (websocketRefreshTimeout) {
+        clearTimeout(websocketRefreshTimeout)
+        websocketRefreshTimeout = null
+      }
       if (refreshInterval) {
         clearInterval(refreshInterval)
       }

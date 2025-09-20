@@ -540,6 +540,8 @@ export default {
     const allTags = ref([])
     
     let searchTimeout
+    let websocketRefreshTimeout
+    let unsubscribeFromDeviceUpdates
     
     const canBatchOccupy = computed(() => {
       return selectedDevices.value.some(device => 
@@ -1120,12 +1122,30 @@ export default {
     
     onMounted(() => {
       loadDevices()
-      
-      // Auto refresh every 30 seconds
+
+      // Ensure WebSocket connection is active
+      store.connectWebSocket()
+
+      unsubscribeFromDeviceUpdates = store.onDeviceUpdate(() => {
+        if (websocketRefreshTimeout) return
+        websocketRefreshTimeout = setTimeout(() => {
+          loadDevices()
+          websocketRefreshTimeout = null
+        }, 500)
+      })
+
+      // Auto refresh every 30 seconds as a fallback
       refreshInterval = setInterval(loadDevices, 30000)
     })
-    
+
     onUnmounted(() => {
+      if (unsubscribeFromDeviceUpdates) {
+        unsubscribeFromDeviceUpdates()
+      }
+      if (websocketRefreshTimeout) {
+        clearTimeout(websocketRefreshTimeout)
+        websocketRefreshTimeout = null
+      }
       if (refreshInterval) {
         clearInterval(refreshInterval)
       }

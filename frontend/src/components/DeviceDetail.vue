@@ -239,7 +239,7 @@
 </template>
 
 <script>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowLeft, Refresh } from '@element-plus/icons-vue'
@@ -256,6 +256,8 @@ export default {
     const loading = ref(false)
     const logsLoading = ref(false)
     const bluetoothLoading = ref(false)
+    let websocketRefreshTimeout
+    let unsubscribeFromDeviceUpdates
     
     const deviceId = computed(() => route.params.deviceId)
     
@@ -466,6 +468,26 @@ export default {
     onMounted(() => {
       loadDevice()
       loadLogs()
+      store.connectWebSocket()
+
+      unsubscribeFromDeviceUpdates = store.onDeviceUpdate(() => {
+        if (websocketRefreshTimeout) return
+        websocketRefreshTimeout = setTimeout(() => {
+          loadDevice()
+          loadLogs()
+          websocketRefreshTimeout = null
+        }, 500)
+      })
+    })
+
+    onUnmounted(() => {
+      if (unsubscribeFromDeviceUpdates) {
+        unsubscribeFromDeviceUpdates()
+      }
+      if (websocketRefreshTimeout) {
+        clearTimeout(websocketRefreshTimeout)
+        websocketRefreshTimeout = null
+      }
     })
     
     return {
