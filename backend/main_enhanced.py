@@ -155,7 +155,7 @@ def parse_bluetoothctl_info(text: str) -> Dict[str, Any]:
                 parsed["rssi"] = int(val)
             except ValueError:
                 parsed["rssi"] = None
-        elif k == "txpower":
+        elif k == "tx_power":
             try:
                 parsed["tx_power"] = int(val)
             except ValueError:
