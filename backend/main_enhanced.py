@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import PlainTextResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -52,8 +53,9 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Background scheduler for device monitoring
-scheduler = BackgroundScheduler()
+# Global state managed during application lifecycle
+scheduler: Optional[BackgroundScheduler] = None
+event_loop: Optional[asyncio.AbstractEventLoop] = None
 update_lock = threading.Lock()
 
 
@@ -286,6 +288,68 @@ def get_adb_device_alias(device_id: str) -> str:
     
     return None
 
+
+
+def parse_mount_output(mount_output: str) -> Dict[str, Dict[str, Any]]:
+    """Parse `mount` command output into a dictionary keyed by mount point."""
+    mounts: Dict[str, Dict[str, Any]] = {}
+    pattern = re.compile(r"^(?P<source>\S+) on (?P<mountpoint>\S+) type (?P<fstype>\S+) \((?P<options>[^)]*)\)")
+
+    for raw_line in mount_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = pattern.match(line)
+        if not match:
+            continue
+
+        options = [opt.strip() for opt in match.group("options").split(',') if opt.strip()]
+        mounts[match.group("mountpoint")] = {
+            "source": match.group("source"),
+            "fstype": match.group("fstype"),
+            "options": options,
+            "writable": any(opt.startswith("rw") for opt in options)
+        }
+
+    return mounts
+
+
+def parse_version_output(version_output: str) -> Dict[str, Optional[str]]:
+    """Parse ql-getversion output to extract host and cabin versions."""
+    normalized: Dict[str, Optional[str]] = {
+        "host": None,
+        "host_starflash": None,
+        "cabin": None,
+        "cabin_starflash": None,
+    }
+
+    keyword_mapping = {
+        "host": ["host", "主机"],
+        "host_starflash": ["host starflash", "主机星闪", "host-starflash", "host star flash", "主机星閃"],
+        "cabin": ["cabin", "座舱", "cockpit"],
+        "cabin_starflash": ["cabin starflash", "座舱星闪", "cabin-starflash", "座舱星閃", "cockpit starflash"],
+    }
+
+    for raw_line in version_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = re.split(r"[:：]", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+
+        key, value = parts[0].strip().lower(), parts[1].strip()
+
+        for field, keywords in keyword_mapping.items():
+            if any(keyword in key for keyword in keywords):
+                normalized[field] = value or None
+                break
+
+    return normalized
+
+
 def scan_adb_devices() -> List[Dict[str, Any]]:
     """Scan for ADB devices and return structured data."""
     devices = []
@@ -422,9 +486,21 @@ def update_devices_in_db():
                 device.status = "offline"
 
         db.commit()
-
-        # Broadcast update to WebSocket clients
-        _broadcast_device_update(current_time)
+        
+        # Broadcast update to WebSocket clients from the main event loop
+        if event_loop and not event_loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    manager.broadcast({
+                        "type": "device_update",
+                        "timestamp": current_time.isoformat()
+                    }),
+                    event_loop,
+                )
+            except RuntimeError as exc:
+                print(f"Failed to schedule broadcast: {exc}")
+        else:
+            print("Event loop unavailable, skipping device update broadcast")
 
     except Exception as e:
         logger.exception("Error updating devices: %s", e)
@@ -449,11 +525,39 @@ async def startup_event():
         scheduler.start()
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Gracefully stop background services when the application shuts down."""
-    if scheduler.running:
+# Lifecycle management hooks
+def start_scheduler():
+    """Start the background scheduler if it is not already running."""
+    global scheduler
+    if scheduler and scheduler.running:
+        return
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(update_devices_in_db, "interval", seconds=30)
+    scheduler.start()
+
+
+def stop_scheduler():
+    """Stop the background scheduler if it is running."""
+    global scheduler
+    if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
+    scheduler = None
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    """Initialize database and background services."""
+    global event_loop
+    create_tables()
+    event_loop = asyncio.get_running_loop()
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    """Clean up background services."""
+    stop_scheduler()
 
 # Authentication endpoints
 @app.post("/auth/register", response_model=User)
@@ -970,6 +1074,136 @@ def get_device_wifi_ap_info(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get WiFi AP info: {str(e)}")
+
+
+@app.get("/api/devices/{device_id}/filesystem/mounts")
+def get_device_mounts(
+    device_id: str,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Inspect mount information for critical paths on an ADB device."""
+    device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if device.device_type != "adb":
+        raise HTTPException(status_code=400, detail="Filesystem inspection is only supported for ADB devices")
+
+    try:
+        result = subprocess.run(
+            ["adb", "-s", device_id, "shell", "mount"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        error_message = getattr(exc, "stderr", None) or str(exc)
+        raise HTTPException(status_code=500, detail=f"Failed to execute mount command: {error_message}")
+
+    mounts = parse_mount_output(result.stdout)
+    mount_points = ["/", "/data/zhuimi"]
+    mount_details = []
+
+    for mount_point in mount_points:
+        entry = mounts.get(mount_point)
+        mount_details.append({
+            "mount_point": mount_point,
+            "found": entry is not None,
+            "source": entry.get("source") if entry else None,
+            "fstype": entry.get("fstype") if entry else None,
+            "options": entry.get("options") if entry else [],
+            "writable": bool(entry.get("writable")) if entry else False,
+        })
+
+    zhuimi_info = next((item for item in mount_details if item["mount_point"] == "/data/zhuimi"), None)
+
+    return {
+        "device_id": device_id,
+        "mounts": mount_details,
+        "zhuimi_writable": zhuimi_info.get("writable") if zhuimi_info else False,
+        "raw_output": result.stdout,
+    }
+
+
+@app.get("/api/devices/{device_id}/versions")
+def get_device_versions(
+    device_id: str,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Fetch version information from an ADB device via ql-getversion."""
+    device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if device.device_type != "adb":
+        raise HTTPException(status_code=400, detail="Version query is only supported for ADB devices")
+
+    try:
+        result = subprocess.run(
+            ["adb", "-s", device_id, "shell", "ql-getversion"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        error_message = getattr(exc, "stderr", None) or str(exc)
+        raise HTTPException(status_code=500, detail=f"Failed to execute ql-getversion: {error_message}")
+
+    versions = parse_version_output(result.stdout)
+
+    return {
+        "device_id": device_id,
+        "versions": versions,
+        "raw_output": result.stdout,
+    }
+
+
+@app.get("/api/devices/{device_id}/logs/fastapi")
+def download_fastapi_log(
+    device_id: str,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Download the FastAPI log file from the device."""
+    device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if device.device_type != "adb":
+        raise HTTPException(status_code=400, detail="Log retrieval is only supported for ADB devices")
+
+    try:
+        result = subprocess.run(
+            ["adb", "-s", device_id, "shell", "cat", "/tmp/log_FastAPI.log"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        error_message = getattr(exc, "stderr", None) or str(exc)
+        raise HTTPException(status_code=500, detail=f"Failed to read log file: {error_message}")
+
+    log_entry = DBDeviceUsageLog(
+        device_id=device.id,
+        user_id=current_user.id,
+        action="download_fastapi_log",
+        notes="Downloaded /tmp/log_FastAPI.log via API",
+    )
+    db.add(log_entry)
+    db.commit()
+
+    filename = f"{device_id}_log_FastAPI.log"
+
+    return PlainTextResponse(
+        result.stdout,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+    )
+
+
 
 if __name__ == "__main__":
     import uvicorn

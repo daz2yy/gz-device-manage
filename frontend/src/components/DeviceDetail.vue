@@ -197,7 +197,141 @@
           </el-collapse-item>
         </el-collapse>
       </div>
-      
+
+      <!-- Filesystem Info -->
+      <div
+        v-if="device.device_type === 'adb'"
+        class="info-card"
+        v-loading="filesystemLoading"
+      >
+        <div class="card-header">
+          <h3>文件系统权限</h3>
+          <div class="card-actions">
+            <el-button size="small" @click="loadFilesystemInfo" :loading="filesystemLoading">
+              <el-icon><Refresh /></el-icon>
+              刷新
+            </el-button>
+          </div>
+        </div>
+
+        <div v-if="filesystemError" class="section-alert">
+          <el-alert :title="filesystemError" type="error" show-icon />
+        </div>
+
+        <template v-if="filesystemInfo">
+          <div
+            v-if="filesystemInfo.zhuimi_writable === false"
+            class="section-alert"
+          >
+            <el-alert
+              title="/data/zhuimi 挂载点未开启写权限，可能导致程序异常"
+              type="error"
+              show-icon
+            />
+          </div>
+
+          <el-table :data="filesystemInfo ? filesystemInfo.mounts : []" size="small">
+            <el-table-column prop="mount_point" label="挂载点" width="160" />
+            <el-table-column prop="source" label="来源" width="200">
+              <template #default="{ row }">
+                <span>{{ row.source || '-' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="fstype" label="文件系统" width="140">
+              <template #default="{ row }">
+                <span>{{ row.fstype || '-' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="options" label="挂载选项">
+              <template #default="{ row }">
+                <span class="mount-options">
+                  {{ row.options && row.options.length ? row.options.join(', ') : '-' }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="writable" label="可写" width="100">
+              <template #default="{ row }">
+                <el-tag :type="row.writable ? 'success' : 'danger'">
+                  {{ row.writable ? '可写' : '只读' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <el-collapse style="margin-top: 20px;">
+            <el-collapse-item title="mount 命令输出" name="mount-raw">
+              <pre class="raw-info">{{ filesystemInfo.raw_output }}</pre>
+            </el-collapse-item>
+          </el-collapse>
+        </template>
+      </div>
+
+      <!-- Version Info -->
+      <div
+        v-if="device.device_type === 'adb'"
+        class="info-card"
+        v-loading="versionLoading"
+      >
+        <div class="card-header">
+          <h3>版本信息</h3>
+          <div class="card-actions">
+            <el-button size="small" @click="loadVersionInfo" :loading="versionLoading">
+              <el-icon><Refresh /></el-icon>
+              刷新
+            </el-button>
+          </div>
+        </div>
+
+        <div v-if="versionError" class="section-alert">
+          <el-alert :title="versionError" type="error" show-icon />
+        </div>
+
+        <template v-if="versionInfo">
+          <div class="info-grid compact-grid">
+            <div class="info-item">
+              <label>主机版本</label>
+              <span>{{ versionInfo.versions?.host || '-' }}</span>
+            </div>
+            <div class="info-item">
+              <label>主机星闪版本</label>
+              <span>{{ versionInfo.versions?.host_starflash || '-' }}</span>
+            </div>
+            <div class="info-item">
+              <label>座舱版本</label>
+              <span>{{ versionInfo.versions?.cabin || '-' }}</span>
+            </div>
+            <div class="info-item">
+              <label>座舱星闪版本</label>
+              <span>{{ versionInfo.versions?.cabin_starflash || '-' }}</span>
+            </div>
+          </div>
+
+          <el-collapse style="margin-top: 20px;">
+            <el-collapse-item title="ql-getversion 原始输出" name="version-raw">
+              <pre class="raw-info">{{ versionInfo.raw_output }}</pre>
+            </el-collapse-item>
+          </el-collapse>
+        </template>
+      </div>
+
+      <!-- Log Tools -->
+      <div v-if="device.device_type === 'adb'" class="info-card">
+        <div class="card-header">
+          <h3>日志工具</h3>
+          <div class="card-actions">
+            <el-button
+              type="primary"
+              :loading="logDownloading"
+              @click="downloadFastApiLog"
+            >
+              <el-icon><Download /></el-icon>
+              拉取 FastAPI 日志
+            </el-button>
+          </div>
+        </div>
+        <p class="card-description">当前仅支持一键拉取 /tmp/log_FastAPI.log。</p>
+      </div>
+
       <!-- Usage Logs -->
       <div class="info-card">
         <div class="card-header">
@@ -242,7 +376,7 @@
 import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, Refresh } from '@element-plus/icons-vue'
+import { ArrowLeft, Refresh, Download } from '@element-plus/icons-vue'
 import { deviceAPI } from '../api.js'
 import { store } from '../store.js'
 
@@ -258,6 +392,13 @@ export default {
     const bluetoothLoading = ref(false)
     let websocketRefreshTimeout
     let unsubscribeFromDeviceUpdates
+    const filesystemInfo = ref(null)
+    const filesystemLoading = ref(false)
+    const filesystemError = ref('')
+    const versionInfo = ref(null)
+    const versionLoading = ref(false)
+    const versionError = ref('')
+    const logDownloading = ref(false)
     
     const deviceId = computed(() => route.params.deviceId)
     
@@ -265,14 +406,24 @@ export default {
       loading.value = true
       try {
         // Get device from devices list (simplified approach)
-        const response = await deviceAPI.getDevices({ 
+        const response = await deviceAPI.getDevices({
           search: deviceId.value,
-          limit: 1 
+          limit: 1
         })
-        
+
         const foundDevice = response.data.find(d => d.device_id === deviceId.value)
         if (foundDevice) {
           device.value = foundDevice
+          if (foundDevice.device_type === 'adb') {
+            await Promise.all([loadFilesystemInfo(), loadVersionInfo()])
+          } else {
+            filesystemInfo.value = null
+            filesystemError.value = ''
+            filesystemLoading.value = false
+            versionInfo.value = null
+            versionError.value = ''
+            versionLoading.value = false
+          }
         } else {
           ElMessage.error('设备不存在')
         }
@@ -296,7 +447,51 @@ export default {
         logsLoading.value = false
       }
     }
-    
+
+    const loadFilesystemInfo = async () => {
+      if (device.value.device_type !== 'adb') {
+        filesystemInfo.value = null
+        filesystemError.value = ''
+        filesystemLoading.value = false
+        return
+      }
+
+      filesystemLoading.value = true
+      filesystemError.value = ''
+      try {
+        const response = await deviceAPI.getFilesystemMounts(deviceId.value)
+        filesystemInfo.value = response.data
+      } catch (error) {
+        console.error('Failed to load filesystem info:', error)
+        filesystemInfo.value = null
+        filesystemError.value = error.response?.data?.detail || '加载文件系统信息失败'
+      } finally {
+        filesystemLoading.value = false
+      }
+    }
+
+    const loadVersionInfo = async () => {
+      if (device.value.device_type !== 'adb') {
+        versionInfo.value = null
+        versionError.value = ''
+        versionLoading.value = false
+        return
+      }
+
+      versionLoading.value = true
+      versionError.value = ''
+      try {
+        const response = await deviceAPI.getVersions(deviceId.value)
+        versionInfo.value = response.data
+      } catch (error) {
+        console.error('Failed to load version info:', error)
+        versionInfo.value = null
+        versionError.value = error.response?.data?.detail || '加载版本信息失败'
+      } finally {
+        versionLoading.value = false
+      }
+    }
+
     const occupyDevice = async () => {
       try {
         await deviceAPI.occupyDevice(deviceId.value, '从设备详情页占用')
@@ -420,20 +615,78 @@ export default {
       try {
         const response = await deviceAPI.bluetoothPair(deviceId.value)
         ElMessage.success('蓝牙配对命令已发送')
-        
+
         // Refresh device info after a short delay
         setTimeout(() => {
           loadDevice()
           loadLogs()
         }, 3000)
-        
+
       } catch (error) {
         ElMessage.error(error.response?.data?.detail || '蓝牙配对失败')
       } finally {
         bluetoothLoading.value = false
       }
     }
-    
+
+    const downloadFastApiLog = async () => {
+      if (device.value.device_type !== 'adb') {
+        ElMessage.warning('仅支持 ADB 设备日志拉取')
+        return
+      }
+
+      logDownloading.value = true
+      try {
+        const response = await deviceAPI.downloadFastApiLog(deviceId.value)
+        const contentType = response.headers['content-type'] || 'text/plain'
+        const blob = new Blob([response.data], { type: contentType })
+        let filename = `${deviceId.value}_log_FastAPI.log`
+        const disposition = response.headers['content-disposition']
+        if (disposition) {
+          const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i)
+          const encodedName = match?.[1] || match?.[2]
+          if (encodedName) {
+            try {
+              filename = decodeURIComponent(encodedName)
+            } catch (e) {
+              filename = encodedName
+            }
+          }
+        }
+
+        const url = window.URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        link.download = filename
+        document.body.appendChild(link)
+        link.click()
+        document.body.removeChild(link)
+        window.URL.revokeObjectURL(url)
+
+        ElMessage.success('日志拉取成功')
+        loadLogs()
+      } catch (error) {
+        console.error('Failed to download log:', error)
+        let message = error.response?.data?.detail || '拉取日志失败'
+        if (!message && error.response?.data instanceof Blob) {
+          try {
+            const text = await error.response.data.text()
+            try {
+              const parsed = JSON.parse(text)
+              message = parsed?.detail || message
+            } catch (parseErr) {
+              message = text || message
+            }
+          } catch (blobError) {
+            console.error('Failed to parse log error response:', blobError)
+          }
+        }
+        ElMessage.error(message || '拉取日志失败')
+      } finally {
+        logDownloading.value = false
+      }
+    }
+
     const goBack = () => {
       // Try to go back to device list, fallback to home if no history
       if (window.history.length > 1) {
@@ -449,18 +702,20 @@ export default {
         'release': '释放',
         'bluetooth_connect': '蓝牙连接',
         'bluetooth_disconnect': '蓝牙断开',
-        'bluetooth_pair': '蓝牙配对'
+        'bluetooth_pair': '蓝牙配对',
+        'download_fastapi_log': '拉取FastAPI日志'
       }
       return labels[action] || action
     }
-    
+
     const getActionTagType = (action) => {
       const types = {
         'occupy': 'warning',
         'release': 'success',
         'bluetooth_connect': 'primary',
         'bluetooth_disconnect': 'info',
-        'bluetooth_pair': 'success'
+        'bluetooth_pair': 'success',
+        'download_fastapi_log': 'primary'
       }
       return types[action] || 'info'
     }
@@ -496,14 +751,24 @@ export default {
       loading,
       logsLoading,
       bluetoothLoading,
+      filesystemInfo,
+      filesystemLoading,
+      filesystemError,
+      versionInfo,
+      versionLoading,
+      versionError,
+      logDownloading,
       store,
       loadDevice,
       loadLogs,
+      loadFilesystemInfo,
+      loadVersionInfo,
       occupyDevice,
       releaseDevice,
       connectBluetooth,
       disconnectBluetooth,
       pairBluetooth,
+      downloadFastApiLog,
       goBack,
       getActionLabel,
       getActionTagType,
@@ -514,7 +779,8 @@ export default {
       formatTime,
       getUsageDuration,
       ArrowLeft,
-      Refresh
+      Refresh,
+      Download
     }
   }
 }
@@ -576,10 +842,20 @@ export default {
   padding: 0;
 }
 
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .info-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
   gap: 20px;
+}
+
+.compact-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
 .info-item {
@@ -614,6 +890,10 @@ export default {
   max-height: 300px;
 }
 
+.mount-options {
+  word-break: break-all;
+}
+
 .text-muted {
   color: #999;
 }
@@ -621,6 +901,16 @@ export default {
 .empty-logs {
   text-align: center;
   padding: 40px 0;
+}
+
+.section-alert {
+  margin-bottom: 15px;
+}
+
+.card-description {
+  margin: 0;
+  color: #666;
+  font-size: 14px;
 }
 
 .bluetooth-controls {

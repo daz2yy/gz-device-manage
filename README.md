@@ -94,6 +94,12 @@ npm run dev
 ./start.sh logs frontend  # 查看前端日志
 ```
 
+## 🧹 初始化工程整理
+
+- 日志文件（`backend.log`、`frontend.log` 等）已从版本库中移除，并通过 `.gitignore` 默认忽略，避免污染仓库。
+- 后端后台任务与数据库初始化改为在 FastAPI 启动阶段执行，确保在开发与测试场景下行为一致。
+- 建议在本地运行前执行 `./start.sh install` 安装依赖，并根据需要创建 `.env`/配置文件。
+
 ## 🔧 开发模式
 
 ### 后端开发

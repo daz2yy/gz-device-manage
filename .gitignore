@@ -1,1 +1,37 @@
+# General
+.DS_Store
 *.pid
+*.log
+logs/
+*.tmp
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.python-version
+venv/
+.venv/
+.env
+.env.*
+*.sqlite3
+*.db
+
+# Node.js / Frontend
+node_modules/
+dist/
+.cache/
+.npm/
+yarn-error.log
+pnpm-debug.log
+
+# Editor directories and files
+.idea/
+.vscode/
+*.iml
