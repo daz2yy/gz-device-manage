@@ -11,6 +11,8 @@ import json
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
+import logging
+import threading
 
 # Import our modules
 from database import get_db, create_tables, Device as DBDevice, User as DBUser, DeviceUsageLog as DBDeviceUsageLog, SessionLocal
@@ -18,6 +20,8 @@ from models import *
 from auth import *
 
 app = FastAPI(title="Device Management System", version="1.0.0")
+
+logger = logging.getLogger(__name__)
 
 # CORS middleware
 app.add_middleware(
@@ -52,6 +56,31 @@ manager = ConnectionManager()
 # Global state managed during application lifecycle
 scheduler: Optional[BackgroundScheduler] = None
 event_loop: Optional[asyncio.AbstractEventLoop] = None
+update_lock = threading.Lock()
+
+
+def _broadcast_device_update(timestamp: datetime) -> None:
+    """Send device update notifications to connected WebSocket clients."""
+    loop = getattr(app.state, "event_loop", None)
+    if not loop or not loop.is_running():
+        logger.debug("Event loop is not available for WebSocket broadcast")
+        return
+
+    future = asyncio.run_coroutine_threadsafe(
+        manager.broadcast({
+            "type": "device_update",
+            "timestamp": timestamp.isoformat(),
+        }),
+        loop,
+    )
+
+    def _log_future_result(fut: asyncio.Future) -> None:
+        try:
+            fut.result()
+        except Exception as exc:  # pragma: no cover - log unexpected broadcast errors
+            logger.error("WebSocket broadcast failed: %s", exc)
+
+    future.add_done_callback(_log_future_result)
 
 def parse_bluetoothctl_info(text: str) -> Dict[str, Any]:
     """Parse `bluetoothctl info` output into structured fields."""
@@ -407,20 +436,24 @@ def scan_bluetooth_devices() -> List[Dict[str, Any]]:
 
 def update_devices_in_db():
     """Background task to update device information in database."""
+    if not update_lock.acquire(blocking=False):
+        logger.debug("Device update skipped because a previous run is still in progress")
+        return
+
     db = SessionLocal()
     try:
         # Scan for devices
         adb_devices = scan_adb_devices()
         bluetooth_devices = scan_bluetooth_devices()
         all_scanned_devices = adb_devices + bluetooth_devices
-        
+
         current_time = datetime.utcnow()
         scanned_device_ids = set()
-        
+
         # Update or create devices
         for device_data in all_scanned_devices:
             scanned_device_ids.add(device_data["device_id"])
-            
+
             db_device = db.query(DBDevice).filter(DBDevice.device_id == device_data["device_id"]).first()
             if db_device:
                 # Update existing device
@@ -440,18 +473,18 @@ def update_devices_in_db():
                     tags="[]"
                 )
                 db.add(db_device)
-        
+
         # Mark devices as offline if not seen
         offline_threshold = current_time - timedelta(minutes=5)
         offline_devices = db.query(DBDevice).filter(
             DBDevice.last_seen < offline_threshold,
             DBDevice.status != "offline"
         ).all()
-        
+
         for device in offline_devices:
             if device.device_id not in scanned_device_ids:
                 device.status = "offline"
-        
+
         db.commit()
         
         # Broadcast update to WebSocket clients from the main event loop
@@ -468,12 +501,29 @@ def update_devices_in_db():
                 print(f"Failed to schedule broadcast: {exc}")
         else:
             print("Event loop unavailable, skipping device update broadcast")
-        
+
     except Exception as e:
-        print(f"Error updating devices: {e}")
+        logger.exception("Error updating devices: %s", e)
         db.rollback()
     finally:
         db.close()
+        update_lock.release()
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize resources when the application starts."""
+    create_tables()
+    loop = asyncio.get_running_loop()
+    app.state.event_loop = loop
+
+    # Run an immediate device scan without blocking the event loop
+    await loop.run_in_executor(None, update_devices_in_db)
+
+    if not scheduler.running:
+        scheduler.add_job(update_devices_in_db, "interval", seconds=30, id="device_monitor", replace_existing=True)
+        scheduler.start()
+
 
 # Lifecycle management hooks
 def start_scheduler():

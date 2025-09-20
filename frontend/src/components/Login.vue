@@ -165,6 +165,7 @@ export default {
         store.setAuth(access_token, null)
         const userResponse = await authAPI.getMe()
         store.setAuth(access_token, userResponse.data)
+        store.connectWebSocket()
         
         ElMessage.success('登录成功')
         router.push('/')
