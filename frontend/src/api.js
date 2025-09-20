@@ -72,7 +72,16 @@ export const deviceAPI = {
   getBluetoothInfo: (deviceId) => api.get(`/devices/${deviceId}/bluetooth/info`),
   
   // WiFi AP operations
-  getWifiApInfo: (deviceId) => api.get(`/devices/${deviceId}/wifi/ap/info`)
+  getWifiApInfo: (deviceId) => api.get(`/devices/${deviceId}/wifi/ap/info`),
+
+  // Filesystem operations
+  getFilesystemMounts: (deviceId) => api.get(`/devices/${deviceId}/filesystem/mounts`),
+
+  // Version information
+  getVersions: (deviceId) => api.get(`/devices/${deviceId}/versions`),
+
+  // Log operations
+  downloadFastApiLog: (deviceId) => api.get(`/devices/${deviceId}/logs/fastapi`, { responseType: 'blob' })
 }
 
 // Legacy API for backward compatibility
