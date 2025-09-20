@@ -48,11 +48,9 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Initialize database
-create_tables()
-
-# Background scheduler for device monitoring
-scheduler = BackgroundScheduler()
+# Global state managed during application lifecycle
+scheduler: Optional[BackgroundScheduler] = None
+event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 def parse_bluetoothctl_info(text: str) -> Dict[str, Any]:
     """Parse `bluetoothctl info` output into structured fields."""
@@ -393,11 +391,20 @@ def update_devices_in_db():
         
         db.commit()
         
-        # Broadcast update to WebSocket clients
-        asyncio.create_task(manager.broadcast({
-            "type": "device_update",
-            "timestamp": current_time.isoformat()
-        }))
+        # Broadcast update to WebSocket clients from the main event loop
+        if event_loop and not event_loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    manager.broadcast({
+                        "type": "device_update",
+                        "timestamp": current_time.isoformat()
+                    }),
+                    event_loop,
+                )
+            except RuntimeError as exc:
+                print(f"Failed to schedule broadcast: {exc}")
+        else:
+            print("Event loop unavailable, skipping device update broadcast")
         
     except Exception as e:
         print(f"Error updating devices: {e}")
@@ -405,9 +412,39 @@ def update_devices_in_db():
     finally:
         db.close()
 
-# Start background scheduler
-scheduler.add_job(update_devices_in_db, 'interval', seconds=30)
-scheduler.start()
+# Lifecycle management hooks
+def start_scheduler():
+    """Start the background scheduler if it is not already running."""
+    global scheduler
+    if scheduler and scheduler.running:
+        return
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(update_devices_in_db, "interval", seconds=30)
+    scheduler.start()
+
+
+def stop_scheduler():
+    """Stop the background scheduler if it is running."""
+    global scheduler
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+    scheduler = None
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    """Initialize database and background services."""
+    global event_loop
+    create_tables()
+    event_loop = asyncio.get_running_loop()
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    """Clean up background services."""
+    stop_scheduler()
 
 # Authentication endpoints
 @app.post("/auth/register", response_model=User)
