@@ -22,6 +22,7 @@ class DeviceBase(BaseModel):
     device_id: str
     device_type: str
     name: Optional[str] = None
+    model: Optional[str] = None
     status: str = "offline"
     group_name: Optional[str] = None
     tags: Optional[List[str]] = []
@@ -31,6 +32,7 @@ class DeviceCreate(DeviceBase):
 
 class DeviceUpdate(BaseModel):
     name: Optional[str] = None
+    model: Optional[str] = None
     status: Optional[str] = None
     group_name: Optional[str] = None
     tags: Optional[List[str]] = None

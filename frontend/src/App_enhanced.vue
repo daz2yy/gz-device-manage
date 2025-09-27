@@ -10,7 +10,7 @@
         <div class="header-left">
           <h1 class="logo">设备管理系统</h1>
           <el-menu
-            :default-active="$route.path"
+            :default-active="activeMenu"
             mode="horizontal"
             router
             class="main-nav"
@@ -97,6 +97,17 @@ export default {
   setup() {
     const router = useRouter()
     const wsConnected = ref(false)
+
+    const activeMenu = computed(() => {
+      const path = router.currentRoute.value.path || ''
+      if (path.startsWith('/devices')) {
+        return '/devices'
+      }
+      if (path.startsWith('/dashboard')) {
+        return '/dashboard'
+      }
+      return path
+    })
     
     const avatarUrl = computed(() => {
       const username = store.user?.username || 'user'
@@ -165,6 +176,7 @@ export default {
       store,
       avatarUrl,
       wsConnected,
+      activeMenu,
       handleUserCommand,
       logout,
       Monitor,

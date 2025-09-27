@@ -1,4 +1,14 @@
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, ForeignKey
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Boolean,
+    DateTime,
+    Text,
+    ForeignKey,
+    text,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -31,6 +41,7 @@ class Device(Base):
     device_id = Column(String, unique=True, index=True)  # ADB device ID or MAC address
     device_type = Column(String)  # adb, bluetooth, wifi, etc.
     name = Column(String)
+    model = Column(String, nullable=True)
     status = Column(String)  # online, offline, occupied
     connection_info = Column(Text)  # JSON string with detailed info
     last_seen = Column(DateTime, default=datetime.utcnow)
@@ -68,6 +79,19 @@ User.usage_logs = relationship("DeviceUsageLog", back_populates="user")
 
 def create_tables():
     Base.metadata.create_all(bind=engine)
+    ensure_schema()
+
+
+def ensure_schema():
+    """Run lightweight schema adjustments for backward compatibility."""
+    with engine.begin() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute(text("PRAGMA table_info(devices)")).mappings()
+        }
+
+        if "model" not in columns:
+            conn.execute(text("ALTER TABLE devices ADD COLUMN model TEXT"))
 
 def get_db():
     db = SessionLocal()

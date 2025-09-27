@@ -9,6 +9,7 @@ from fastapi import (
     UploadFile,
     File,
     Form,
+    Body,
 )
 from fastapi.responses import PlainTextResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -25,9 +26,11 @@ import posixpath
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
+import asyncio.subprocess as aio_subprocess
 import logging
 import threading
 import time
+import shlex
 
 # Import our modules
 from database import get_db, create_tables, Device as DBDevice, User as DBUser, DeviceUsageLog as DBDeviceUsageLog, SessionLocal
@@ -72,6 +75,165 @@ manager = ConnectionManager()
 scheduler: Optional[BackgroundScheduler] = None
 event_loop: Optional[asyncio.AbstractEventLoop] = None
 update_lock = threading.Lock()
+
+TERMINAL_TIMEOUT_SECONDS = 600
+MAX_TERMINAL_COMMAND_CHARS = 512
+MAX_TERMINAL_RESPONSE_CHARS = 8000
+TERMINAL_LOG_PREVIEW = 800
+ALLOWED_ADB_BASE_COMMANDS = {
+    "shell",
+    "logcat",
+    "reboot",
+    "install",
+    "uninstall",
+    "pull",
+    "push",
+    "bugreport",
+    "forward",
+    "reverse",
+    "tcpip",
+    "usb",
+    "wait-for-device",
+    "get-state",
+    "get-serialno",
+    "devices",
+    "version",
+    "exec-out",
+    "reconnect",
+}
+DISALLOWED_ADB_BASE_COMMANDS = {
+    "kill-server",
+    "start-server",
+    "root",
+    "unroot",
+}
+DISALLOWED_SHELL_PATTERNS = (
+    "su",
+    "reboot bootloader",
+    "reboot recovery",
+    "reboot fastboot",
+    "reboot download",
+    "rm -rf /",
+)
+
+
+def _truncate(text: Optional[str], limit: int) -> Optional[str]:
+    if text is None:
+        return None
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _record_device_log(
+    db: Session,
+    device: DBDevice,
+    current_user: DBUser,
+    action: str,
+    notes: Optional[str] = None,
+) -> None:
+    log_entry = DBDeviceUsageLog(
+        device_id=device.id,
+        user_id=current_user.id,
+        action=action,
+        notes=notes,
+    )
+    db.add(log_entry)
+    db.commit()
+
+
+def _ensure_device_control_permission(device: DBDevice, current_user: DBUser) -> None:
+    if device.device_type != "adb":
+        raise HTTPException(status_code=400, detail="Operation only supported for ADB devices")
+
+    if current_user.role == "admin":
+        return
+
+    if device.occupied_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Device is not assigned to you")
+
+
+def _prepare_adb_command(device_id: str, command: str) -> List[str]:
+    if not command:
+        raise HTTPException(status_code=400, detail="Command cannot be empty")
+
+    command = command.strip()
+    if len(command) > MAX_TERMINAL_COMMAND_CHARS:
+        raise HTTPException(status_code=400, detail="Command is too long")
+
+    if any(delimiter in command for delimiter in ["\\n", "\r", "&&", "||"]):
+        raise HTTPException(status_code=400, detail="Chained commands are not allowed")
+
+    original_tokens = shlex.split(command)
+    if not original_tokens:
+        raise HTTPException(status_code=400, detail="Unable to parse command")
+
+    tokens = list(original_tokens)
+    # Strip optional adb prefix
+    if tokens[0] == "adb":
+        tokens = tokens[1:]
+
+    if tokens and tokens[0] == "-s":
+        if len(tokens) < 3:
+            raise HTTPException(status_code=400, detail="Malformed adb command")
+        # Drop user-provided serial; we enforce server-side device id
+        tokens = tokens[2:]
+
+    if not tokens:
+        raise HTTPException(status_code=400, detail="Command missing adb operation")
+
+    base_command = tokens[0]
+    normalized_base = base_command.lower()
+    tokens[0] = normalized_base
+
+    if normalized_base in DISALLOWED_ADB_BASE_COMMANDS:
+        raise HTTPException(status_code=400, detail=f"Command '{base_command}' is not permitted")
+
+    if normalized_base not in ALLOWED_ADB_BASE_COMMANDS:
+        shell_payload = " ".join(original_tokens).lower()
+        for pattern in DISALLOWED_SHELL_PATTERNS:
+            if shell_payload.startswith(pattern) or pattern in shell_payload:
+                raise HTTPException(status_code=400, detail=f"Shell command containing '{pattern}' is not permitted")
+
+        return ["adb", "-s", device_id, "shell", *original_tokens]
+
+    if normalized_base == "shell" and len(tokens) > 1:
+        shell_payload = " ".join(tokens[1:]).lower()
+        for pattern in DISALLOWED_SHELL_PATTERNS:
+            if shell_payload.startswith(pattern) or pattern in shell_payload:
+                raise HTTPException(status_code=400, detail=f"Shell command containing '{pattern}' is not permitted")
+
+    return ["adb", "-s", device_id, *tokens]
+
+
+async def _execute_adb_command(command_tokens: List[str]) -> Dict[str, Any]:
+    process = await asyncio.create_subprocess_exec(
+        *command_tokens,
+        stdout=aio_subprocess.PIPE,
+        stderr=aio_subprocess.PIPE,
+    )
+
+    stdout_bytes, stderr_bytes = await process.communicate()
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+    return {
+        "returncode": process.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def _build_command_log(command: str, result: Dict[str, Any], status: str) -> str:
+    payload = {
+        "command": command,
+        "returncode": result.get("returncode"),
+        "status": status,
+        "stdout_preview": _truncate(result.get("stdout"), TERMINAL_LOG_PREVIEW),
+        "stderr_preview": _truncate(result.get("stderr"), TERMINAL_LOG_PREVIEW),
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _broadcast_device_update(timestamp: datetime) -> None:
@@ -789,6 +951,7 @@ def get_devices(
     device_type: Optional[str] = None,
     status: Optional[str] = None,
     search: Optional[str] = None,
+    model: Optional[str] = None,
     group: Optional[str] = None,
     skip: int = 0,
     limit: int = 100,
@@ -805,11 +968,14 @@ def get_devices(
             DBDevice.name.contains(search) | 
             DBDevice.device_id.contains(search)
         )
+    if model:
+        query = query.filter(DBDevice.model.isnot(None))
+        query = query.filter(DBDevice.model.contains(model))
     if group:
         query = query.filter(DBDevice.group_name == group)
-    
+
     devices = query.offset(skip).limit(limit).all()
-    
+
     # Convert to response model with user info
     result = []
     for device in devices:
@@ -818,6 +984,7 @@ def get_devices(
             "device_id": device.device_id,
             "device_type": device.device_type,
             "name": device.name,
+            "model": device.model,
             "status": device.status,
             "connection_info": json.loads(device.connection_info) if device.connection_info else {},
             "last_seen": device.last_seen,
@@ -932,6 +1099,161 @@ def release_device(
     
     return {"message": "Device released successfully"}
 
+
+@app.post("/api/devices/{device_id}/actions/reboot")
+async def reboot_device(
+    device_id: str,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    _ensure_device_control_permission(device, current_user)
+
+    tokens = ["adb", "-s", device_id, "reboot"]
+    result = await _execute_adb_command(tokens)
+    status = "success" if result["returncode"] == 0 else "error"
+    _record_device_log(
+        db,
+        device,
+        current_user,
+        "reboot",
+        _build_command_log("reboot", result, status),
+    )
+
+    if result["returncode"] != 0:
+        error_message = result["stderr"].strip() or "Failed to send reboot command"
+        raise HTTPException(status_code=500, detail=error_message)
+
+    return {"message": "Reboot command sent"}
+
+
+@app.post("/api/devices/{device_id}/actions/install-apk")
+async def install_apk(
+    device_id: str,
+    apk_file: UploadFile = File(...),
+    reinstall: bool = Form(True),
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    _ensure_device_control_permission(device, current_user)
+
+    original_name = apk_file.filename or "upload.apk"
+    suffix = os.path.splitext(original_name)[1] or ".apk"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        file_path = tmp.name
+        content = await apk_file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Uploaded APK file is empty")
+        tmp.write(content)
+        tmp.flush()
+
+    try:
+        tokens = ["adb", "-s", device_id, "install"]
+        if reinstall:
+            tokens.append("-r")
+        tokens.append(file_path)
+
+        result = await _execute_adb_command(tokens)
+        status = "success" if result["returncode"] == 0 else "error"
+        _record_device_log(
+            db,
+            device,
+            current_user,
+            "install_apk",
+            _build_command_log(
+                f"install {'-r ' if reinstall else ''}{original_name}",
+                result,
+                status,
+            ),
+        )
+
+        if result["returncode"] != 0:
+            error_message = result["stderr"].strip() or "Failed to install APK"
+            raise HTTPException(status_code=500, detail=error_message)
+
+        return {
+            "message": "APK installed successfully",
+            "stdout": result["stdout"],
+        }
+    finally:
+        try:
+            os.unlink(file_path)
+        except OSError:
+            pass
+
+
+@app.post("/api/devices/{device_id}/actions/logcat")
+async def fetch_logcat(
+    device_id: str,
+    body: Dict[str, Any] = Body(default={}),
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    _ensure_device_control_permission(device, current_user)
+
+    lines = body.get("lines")
+    buffer_name = body.get("buffer")
+    log_format = body.get("format")
+    clear_after = body.get("clear", False)
+
+    tokens = ["adb", "-s", device_id, "logcat", "-d"]
+    command_descriptor = "logcat -d"
+
+    if buffer_name:
+        tokens.extend(["-b", str(buffer_name)])
+        command_descriptor += f" -b {buffer_name}"
+
+    if lines:
+        try:
+            line_count = int(lines)
+            if line_count <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="lines must be a positive integer")
+        tokens.extend(["-t", str(line_count)])
+        command_descriptor += f" -t {line_count}"
+
+    if log_format:
+        tokens.extend(["-v", str(log_format)])
+        command_descriptor += f" -v {log_format}"
+
+    result = await _execute_adb_command(tokens)
+    status = "success" if result["returncode"] == 0 else "error"
+    _record_device_log(
+        db,
+        device,
+        current_user,
+        "adb_logcat",
+        _build_command_log(command_descriptor, result, status),
+    )
+
+    if result["returncode"] != 0:
+        error_message = result["stderr"].strip() or "Failed to collect logcat output"
+        raise HTTPException(status_code=500, detail=error_message)
+
+    if clear_after:
+        await _execute_adb_command(["adb", "-s", device_id, "logcat", "-c"])
+
+    filename = f"{device_id}_logcat_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
+    return PlainTextResponse(
+        result["stdout"],
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+        media_type="text/plain; charset=utf-8",
+    )
+
 @app.put("/api/devices/{device_id}")
 def update_device(
     device_id: str,
@@ -945,6 +1267,8 @@ def update_device(
     
     if device_update.name is not None:
         device.name = device_update.name
+    if device_update.model is not None:
+        device.model = device_update.model
     if device_update.status is not None:
         device.status = device_update.status
     if device_update.group_name is not None:
@@ -987,9 +1311,10 @@ def get_device_logs(
             "device": {
                 "id": device.id,
                 "device_id": device.device_id,
-                "device_type": device.device_type,
-                "name": device.name,
-                "status": device.status,
+            "device_type": device.device_type,
+            "name": device.name,
+            "model": device.model,
+            "status": device.status,
                 "connection_info": json.loads(device.connection_info) if device.connection_info else {},
                 "last_seen": device.last_seen,
                 "created_at": device.created_at,
@@ -1532,6 +1857,122 @@ def download_fastapi_log(
             "Content-Disposition": f'attachment; filename="{filename}"'
         }
     )
+
+
+@app.websocket("/ws/devices/{device_id}/terminal")
+async def adb_terminal(websocket: WebSocket, device_id: str):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008, reason="Missing authentication token")
+        return
+
+    db = SessionLocal()
+    try:
+        try:
+            current_user = get_user_from_token(token, db)
+        except HTTPException as exc:
+            await websocket.close(code=1008, reason=exc.detail)
+            return
+
+        device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+        if not device:
+            await websocket.close(code=1008, reason="Device not found")
+            return
+
+        try:
+            _ensure_device_control_permission(device, current_user)
+        except HTTPException as exc:
+            await websocket.close(code=1008, reason=exc.detail)
+            return
+
+        await websocket.accept()
+        await websocket.send_json({
+            "type": "ready",
+            "message": f"Connected to {device.name or device.device_id}",
+            "device_id": device.device_id,
+        })
+
+        while True:
+            try:
+                payload = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=TERMINAL_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                await websocket.send_json({
+                    "type": "timeout",
+                    "message": "Session closed due to inactivity",
+                })
+                break
+            except WebSocketDisconnect:
+                break
+
+            if not isinstance(payload, dict):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid payload",
+                })
+                continue
+
+            if payload.get("type") != "command":
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Unsupported message type",
+                })
+                continue
+
+            command_text = (payload.get("command") or "").strip()
+            if not command_text:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Command cannot be empty",
+                })
+                continue
+
+            try:
+                tokens = _prepare_adb_command(device.device_id, command_text)
+            except HTTPException as exc:
+                await websocket.send_json({
+                    "type": "error",
+                    "command": command_text,
+                    "message": exc.detail,
+                })
+                continue
+
+            result = await _execute_adb_command(tokens)
+            status = "success" if result["returncode"] == 0 else "error"
+
+            db.refresh(device)
+            try:
+                _ensure_device_control_permission(device, current_user)
+            except HTTPException as exc:
+                await websocket.send_json({
+                    "type": "error",
+                    "command": command_text,
+                    "message": exc.detail,
+                })
+                break
+
+            _record_device_log(
+                db,
+                device,
+                current_user,
+                "adb_terminal",
+                _build_command_log(command_text, result, status),
+            )
+
+            await websocket.send_json({
+                "type": "output",
+                "command": command_text,
+                "status": status,
+                "returncode": result["returncode"],
+                "stdout": _truncate(result["stdout"], MAX_TERMINAL_RESPONSE_CHARS),
+                "stderr": _truncate(result["stderr"], MAX_TERMINAL_RESPONSE_CHARS),
+            })
+
+        await websocket.close()
+    finally:
+        db.close()
 
 
 

@@ -26,6 +26,18 @@
           </el-input>
         </el-col>
         <el-col :span="4">
+          <el-input
+            v-model="filters.model"
+            placeholder="搜索设备型号"
+            clearable
+            @input="handleSearch"
+          >
+            <template #prefix>
+              <el-icon><Search /></el-icon>
+            </template>
+          </el-input>
+        </el-col>
+        <el-col :span="4">
           <el-select v-model="filters.device_type" placeholder="设备类型" clearable @change="loadDevices">
             <el-option label="全部" value="" />
             <el-option label="ADB" value="adb" />
@@ -77,6 +89,7 @@
                 </el-tag>
                 <h3 class="device-name">{{ group.adbDevice.name }}</h3>
                 <span class="device-id">ID: {{ group.adbDevice.device_id }}</span>
+                <span v-if="group.adbDevice.model" class="device-model">型号: {{ group.adbDevice.model }}</span>
                 <el-tag :type="getStatusTagType(group.adbDevice.status)" class="status-tag">
                   {{ getStatusLabel(group.adbDevice.status) }}
                 </el-tag>
@@ -519,6 +532,7 @@ export default {
     
     const filters = reactive({
       search: '',
+      model: '',
       device_type: '',
       status: 'online',  // 默认显示在线设备
       group: ''
@@ -690,6 +704,7 @@ export default {
     const resetFilters = () => {
       Object.assign(filters, {
         search: '',
+        model: '',
         device_type: '',
         status: 'online',  // 重置时也默认显示在线设备
         group: ''
@@ -1406,6 +1421,11 @@ export default {
   background: #f5f7fa;
   padding: 2px 8px;
   border-radius: 4px;
+}
+
+.device-model {
+  font-size: 12px;
+  color: #909399;
 }
 
 .status-tag {

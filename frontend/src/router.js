@@ -6,6 +6,7 @@ import Login from './components/Login.vue'
 import Dashboard from './components/Dashboard.vue'
 import DeviceList from './components/DeviceList.vue'
 import DeviceDetail from './components/DeviceDetail.vue'
+import DeviceTerminal from './components/DeviceTerminal.vue'
 import UserProfile from './components/UserProfile.vue'
 
 const routes = [
@@ -35,6 +36,12 @@ const routes = [
     path: '/devices/:deviceId',
     name: 'DeviceDetail',
     component: DeviceDetail,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/devices/:deviceId/terminal',
+    name: 'DeviceTerminal',
+    component: DeviceTerminal,
     meta: { requiresAuth: true }
   },
   {

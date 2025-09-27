@@ -110,7 +110,24 @@ export const deviceAPI = {
   getVersions: (deviceId) => api.get(`/devices/${deviceId}/versions`),
 
   // Log operations
-  downloadFastApiLog: (deviceId) => api.get(`/devices/${deviceId}/logs/fastapi`, { responseType: 'blob' })
+  downloadFastApiLog: (deviceId) => api.get(`/devices/${deviceId}/logs/fastapi`, { responseType: 'blob' }),
+  
+  rebootDevice: (deviceId) => api.post(`/devices/${deviceId}/actions/reboot`),
+  installApk: (deviceId, file, options = {}) => {
+    const formData = new FormData()
+    formData.append('apk_file', file)
+    if (typeof options.reinstall === 'boolean') {
+      formData.append('reinstall', options.reinstall)
+    }
+    return api.post(`/devices/${deviceId}/actions/install-apk`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+  },
+  fetchLogcat: (deviceId, options = {}) => api.post(
+    `/devices/${deviceId}/actions/logcat`,
+    options,
+    { responseType: 'blob' }
+  )
 }
 
 // Legacy API for backward compatibility

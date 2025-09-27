@@ -31,6 +31,14 @@
         >
           强制释放
         </el-button>
+        <el-button
+          v-if="device.device_type === 'adb' && canControlDevice"
+          type="info"
+          @click="openTerminal"
+        >
+          <el-icon><Cpu /></el-icon>
+          ADB Terminal
+        </el-button>
         
         <!-- Bluetooth Controls -->
         <div v-if="device.device_type === 'bluetooth'" class="bluetooth-controls">
@@ -81,6 +89,10 @@
                 <el-tag :type="getStatusTagType(device.status)">
                   {{ getStatusLabel(device.status) }}
                 </el-tag>
+              </div>
+              <div class="info-item">
+                <label>设备型号</label>
+                <span>{{ device.model || '-' }}</span>
               </div>
               <div class="info-item">
                 <label>设备分组</label>
@@ -196,6 +208,116 @@
             <pre class="raw-info">{{ JSON.stringify(device.connection_info, null, 2) }}</pre>
           </el-collapse-item>
         </el-collapse>
+      </div>
+
+      <!-- Remote Controls -->
+      <div
+        v-if="device.device_type === 'adb'"
+        class="info-card control-card"
+      >
+        <div class="card-header">
+          <h3>远程控制</h3>
+        </div>
+
+        <el-alert
+          v-if="!canControlDevice"
+          class="control-alert"
+          type="info"
+          show-icon
+          title="需要占用该设备或拥有管理员权限才能执行以下操作"
+        />
+
+        <div class="control-content">
+          <div class="control-group">
+            <h4>快速操作</h4>
+            <el-button
+              type="danger"
+              :loading="rebootLoading"
+              :disabled="!canControlDevice"
+              @click="handleReboot"
+            >
+              <el-icon><Refresh /></el-icon>
+              远程重启
+            </el-button>
+            <p class="control-desc">发送 adb reboot 指令，设备将立即重启。</p>
+          </div>
+
+          <div class="control-group">
+            <h4>安装 APK</h4>
+            <el-upload
+              ref="apkUploader"
+              class="apk-upload"
+              :auto-upload="false"
+              :show-file-list="false"
+              :on-change="handleApkChange"
+              :before-upload="() => false"
+              accept=".apk"
+              :disabled="!canControlDevice"
+            >
+              <el-button type="primary" :disabled="!canControlDevice">
+                <el-icon><UploadFilled /></el-icon>
+                选择 APK
+              </el-button>
+            </el-upload>
+            <div v-if="hasSelectedApk" class="apk-selected">
+              <el-tag size="small">{{ selectedApkName }}</el-tag>
+              <el-button text size="small" @click="clearSelectedApk">清除</el-button>
+            </div>
+            <el-checkbox v-model="reinstallApk" :disabled="!canControlDevice">
+              允许覆盖安装 (-r)
+            </el-checkbox>
+            <el-button
+              type="success"
+              :loading="installingApk"
+              :disabled="!canControlDevice || !hasSelectedApk"
+              @click="installSelectedApk"
+            >
+              安装 APK
+            </el-button>
+            <p class="control-desc">将选定的 APK 推送并安装到设备上。</p>
+          </div>
+
+          <div class="control-group">
+            <h4>导出 Logcat</h4>
+            <el-form inline class="logcat-form">
+              <el-form-item label="缓冲区">
+                <el-select v-model="logcatOptions.buffer" :disabled="!canControlDevice">
+                  <el-option
+                    v-for="buffer in logcatBuffers"
+                    :key="buffer"
+                    :label="buffer"
+                    :value="buffer"
+                  />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="行数">
+                <el-input-number
+                  v-model="logcatOptions.lines"
+                  :min="10"
+                  :max="5000"
+                  :disabled="!canControlDevice"
+                />
+              </el-form-item>
+              <el-form-item>
+                <el-switch
+                  v-model="logcatOptions.clear"
+                  :disabled="!canControlDevice"
+                  active-text="导出后清空"
+                />
+              </el-form-item>
+            </el-form>
+            <el-button
+              type="primary"
+              :loading="logcatLoading"
+              :disabled="!canControlDevice"
+              @click="handleLogcat"
+            >
+              <el-icon><Document /></el-icon>
+              导出 Logcat
+            </el-button>
+            <p class="control-desc">拉取指定缓冲区的日志并下载到本地。</p>
+          </div>
+        </div>
       </div>
 
       <!-- Filesystem Info -->
@@ -398,7 +520,7 @@
           </el-table-column>
           <el-table-column prop="notes" label="备注">
             <template #default="{ row }">
-              <span v-if="row.notes">{{ row.notes }}</span>
+              <span v-if="row.notes">{{ formatLogNotes(row.notes) }}</span>
               <span v-else class="text-muted">-</span>
             </template>
           </el-table-column>
@@ -413,10 +535,10 @@
 </template>
 
 <script>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, reactive, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, Refresh, Download } from '@element-plus/icons-vue'
+import { ArrowLeft, Refresh, Download, UploadFilled, Cpu, Document } from '@element-plus/icons-vue'
 import { deviceAPI } from '../api.js'
 import { store } from '../store.js'
 
@@ -439,8 +561,30 @@ export default {
     const versionLoading = ref(false)
     const versionError = ref('')
     const logDownloading = ref(false)
+    const rebootLoading = ref(false)
+    const installingApk = ref(false)
+    const logcatLoading = ref(false)
+    const selectedApk = ref(null)
+    const selectedApkName = ref('')
+    const apkUploader = ref(null)
+    const reinstallApk = ref(true)
+    const logcatOptions = reactive({
+      buffer: 'main',
+      lines: 200,
+      clear: false
+    })
+    const hasSelectedApk = computed(() => !!selectedApk.value)
     
     const deviceId = computed(() => route.params.deviceId)
+    const canControlDevice = computed(() => {
+      if (!device.value || device.value.device_type !== 'adb') {
+        return false
+      }
+      if (store.user?.role === 'admin') {
+        return true
+      }
+      return device.value.occupied_by === store.user?.id
+    })
     
     const loadDevice = async () => {
       loading.value = true
@@ -553,7 +697,31 @@ export default {
         ElMessage.error(error.response?.data?.detail || '释放设备失败')
       }
     }
-    
+
+    const saveBlobToFile = (blob, fallbackName, disposition) => {
+      let filename = fallbackName
+      if (disposition) {
+        const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i)
+        const encodedName = match?.[1] || match?.[2]
+        if (encodedName) {
+          try {
+            filename = decodeURIComponent(encodedName)
+          } catch (error) {
+            filename = encodedName
+          }
+        }
+      }
+
+      const url = window.URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(url)
+    }
+
     const getDeviceTypeLabel = (type) => {
       const labels = {
         'adb': 'ADB',
@@ -718,6 +886,128 @@ export default {
       }
     }
 
+    const handleReboot = async () => {
+      if (!canControlDevice.value) {
+        ElMessage.warning('当前账号无权操作该设备')
+        return
+      }
+
+      rebootLoading.value = true
+      try {
+        await deviceAPI.rebootDevice(deviceId.value)
+        ElMessage.success('重启命令已发送')
+        loadLogs()
+      } catch (error) {
+        ElMessage.error(error.response?.data?.detail || '远程重启失败')
+      } finally {
+        rebootLoading.value = false
+      }
+    }
+
+    const handleApkChange = (uploadFile) => {
+      if (!uploadFile?.raw) {
+        return false
+      }
+
+      const fileName = uploadFile.name || uploadFile.raw.name || ''
+      if (!fileName.toLowerCase().endsWith('.apk')) {
+        ElMessage.error('仅支持上传 APK 文件')
+        return false
+      }
+
+      selectedApk.value = uploadFile.raw
+      selectedApkName.value = fileName
+      ElMessage.info(`已选择 ${fileName}`)
+      return false
+    }
+
+    const clearSelectedApk = () => {
+      selectedApk.value = null
+      selectedApkName.value = ''
+      if (apkUploader.value) {
+        apkUploader.value.clearFiles()
+      }
+    }
+
+    const installSelectedApk = async () => {
+      if (!canControlDevice.value) {
+        ElMessage.warning('当前账号无权操作该设备')
+        return
+      }
+      if (!selectedApk.value) {
+        ElMessage.warning('请先选择 APK 文件')
+        return
+      }
+
+      installingApk.value = true
+      try {
+        await deviceAPI.installApk(deviceId.value, selectedApk.value, { reinstall: reinstallApk.value })
+        ElMessage.success('APK 安装成功')
+        loadLogs()
+        clearSelectedApk()
+      } catch (error) {
+        ElMessage.error(error.response?.data?.detail || '安装 APK 失败')
+      } finally {
+        installingApk.value = false
+      }
+    }
+
+    const logcatBuffers = ['main', 'system', 'radio', 'events', 'crash']
+
+    const handleLogcat = async () => {
+      if (!canControlDevice.value) {
+        ElMessage.warning('当前账号无权操作该设备')
+        return
+      }
+
+      logcatLoading.value = true
+      try {
+        let lines = Number(logcatOptions.lines)
+        if (!Number.isFinite(lines) || lines <= 0) {
+          lines = 200
+        }
+        const payload = {
+          buffer: logcatOptions.buffer,
+          lines,
+          clear: logcatOptions.clear
+        }
+        const response = await deviceAPI.fetchLogcat(deviceId.value, payload)
+        const blob = response.data instanceof Blob ? response.data : new Blob([response.data])
+        const fallbackName = `${deviceId.value}_logcat.log`
+        saveBlobToFile(blob, fallbackName, response.headers['content-disposition'])
+        ElMessage.success('Logcat 日志已下载')
+        loadLogs()
+      } catch (error) {
+        if (error.response?.data instanceof Blob) {
+          try {
+            const text = await error.response.data.text()
+            const parsed = JSON.parse(text)
+            ElMessage.error(parsed?.detail || '拉取 Logcat 失败')
+          } catch (parseError) {
+            ElMessage.error('拉取 Logcat 失败')
+          }
+        } else {
+          ElMessage.error(error.response?.data?.detail || '拉取 Logcat 失败')
+        }
+      } finally {
+        logcatLoading.value = false
+      }
+    }
+
+    const openTerminal = () => {
+      if (!canControlDevice.value) {
+        ElMessage.warning('当前账号无权操作该设备')
+        return
+      }
+      router.push({ name: 'DeviceTerminal', params: { deviceId: deviceId.value } })
+    }
+
+    watch(deviceId, () => {
+      clearSelectedApk()
+      loadDevice()
+      loadLogs()
+    })
+
     const downloadFastApiLog = async () => {
       if (device.value.device_type !== 'adb') {
         ElMessage.warning('仅支持 ADB 设备日志拉取')
@@ -729,28 +1019,7 @@ export default {
         const response = await deviceAPI.downloadFastApiLog(deviceId.value)
         const contentType = response.headers['content-type'] || 'text/plain'
         const blob = new Blob([response.data], { type: contentType })
-        let filename = `${deviceId.value}_log_FastCGIServer.log`
-        const disposition = response.headers['content-disposition']
-        if (disposition) {
-          const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i)
-          const encodedName = match?.[1] || match?.[2]
-          if (encodedName) {
-            try {
-              filename = decodeURIComponent(encodedName)
-            } catch (e) {
-              filename = encodedName
-            }
-          }
-        }
-
-        const url = window.URL.createObjectURL(blob)
-        const link = document.createElement('a')
-        link.href = url
-        link.download = filename
-        document.body.appendChild(link)
-        link.click()
-        document.body.removeChild(link)
-        window.URL.revokeObjectURL(url)
+        saveBlobToFile(blob, `${deviceId.value}_log_FastCGIServer.log`, response.headers['content-disposition'])
 
         ElMessage.success('日志拉取成功')
         loadLogs()
@@ -787,26 +1056,60 @@ export default {
     
     const getActionLabel = (action) => {
       const labels = {
-        'occupy': '占用',
-        'release': '释放',
-        'bluetooth_connect': '蓝牙连接',
-        'bluetooth_disconnect': '蓝牙断开',
-        'bluetooth_pair': '蓝牙配对',
-        'download_fastapi_log': '拉取FastAPI日志'
+        occupy: '占用',
+        release: '释放',
+        bluetooth_connect: '蓝牙连接',
+        bluetooth_disconnect: '蓝牙断开',
+        bluetooth_pair: '蓝牙配对',
+        download_fastapi_log: '拉取FastAPI日志',
+        reboot: '远程重启',
+        install_apk: '安装APK',
+        adb_logcat: '导出Logcat',
+        adb_terminal: 'ADB终端',
+        filesystem_push: '文件推送'
       }
       return labels[action] || action
     }
 
     const getActionTagType = (action) => {
       const types = {
-        'occupy': 'warning',
-        'release': 'success',
-        'bluetooth_connect': 'primary',
-        'bluetooth_disconnect': 'info',
-        'bluetooth_pair': 'success',
-        'download_fastapi_log': 'primary'
+        occupy: 'warning',
+        release: 'success',
+        bluetooth_connect: 'primary',
+        bluetooth_disconnect: 'info',
+        bluetooth_pair: 'success',
+        download_fastapi_log: 'primary',
+        reboot: 'danger',
+        install_apk: 'success',
+        adb_logcat: 'info',
+        adb_terminal: 'info',
+        filesystem_push: 'info'
       }
       return types[action] || 'info'
+    }
+
+    const formatLogNotes = (notes) => {
+      if (!notes) return ''
+      if (typeof notes !== 'string') return String(notes)
+      try {
+        const parsed = JSON.parse(notes)
+        const parts = []
+        if (parsed.command) {
+          parts.push(`命令: ${parsed.command}`)
+        }
+        if (parsed.status) {
+          parts.push(`状态: ${parsed.status}`)
+        }
+        if (parsed.stdout_preview) {
+          parts.push(`输出: ${parsed.stdout_preview}`)
+        }
+        if (parsed.stderr_preview) {
+          parts.push(`错误: ${parsed.stderr_preview}`)
+        }
+        return parts.length ? parts.join(' | ') : notes
+      } catch (error) {
+        return notes
+      }
     }
     
     onMounted(() => {
@@ -832,8 +1135,9 @@ export default {
         clearTimeout(websocketRefreshTimeout)
         websocketRefreshTimeout = null
       }
+      clearSelectedApk()
     })
-    
+
     return {
       device,
       logs,
@@ -847,7 +1151,18 @@ export default {
       versionLoading,
       versionError,
       logDownloading,
+      rebootLoading,
+      installingApk,
+      logcatLoading,
+      selectedApkName,
+      reinstallApk,
+      logcatOptions,
+      logcatBuffers,
+      hasSelectedApk,
+      apkUploader,
       store,
+      deviceId,
+      canControlDevice,
       loadDevice,
       loadLogs,
       loadFilesystemInfo,
@@ -857,6 +1172,12 @@ export default {
       connectBluetooth,
       disconnectBluetooth,
       pairBluetooth,
+      handleReboot,
+      handleApkChange,
+      installSelectedApk,
+      clearSelectedApk,
+      handleLogcat,
+      openTerminal,
       downloadFastApiLog,
       goBack,
       getActionLabel,
@@ -865,6 +1186,7 @@ export default {
       getDeviceTypeTagType,
       getStatusLabel,
       getStatusTagType,
+      formatLogNotes,
       formatCapacity,
       formatPercent,
       getUsagePercentage,
@@ -872,7 +1194,10 @@ export default {
       getUsageDuration,
       ArrowLeft,
       Refresh,
-      Download
+      Download,
+      UploadFilled,
+      Cpu,
+      Document
     }
   }
 }
@@ -1027,5 +1352,58 @@ export default {
   margin-left: 10px;
   padding-left: 10px;
   border-left: 2px solid #e4e7ed;
+}
+
+.control-card {
+  padding: 0 20px 20px 20px;
+}
+
+.control-content {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.control-group {
+  background: #f7f9fc;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.control-group h4 {
+  margin: 0 0 12px 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.control-desc {
+  margin-top: 10px;
+  color: #909399;
+  font-size: 13px;
+}
+
+.apk-upload {
+  margin-bottom: 12px;
+}
+
+.apk-selected {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 12px 0;
+}
+
+.logcat-form {
+  margin-bottom: 12px;
+  gap: 12px;
+}
+
+.logcat-form .el-form-item {
+  margin-right: 12px;
+}
+
+.control-alert {
+  margin: 16px 0;
 }
 </style>
