@@ -17,6 +17,10 @@ const routes = [
   },
   {
     path: '/',
+    redirect: '/devices'
+  },
+  {
+    path: '/dashboard',
     name: 'Dashboard',
     component: Dashboard,
     meta: { requiresAuth: true }
@@ -53,7 +57,7 @@ router.beforeEach((to, from, next) => {
   if (to.meta.requiresAuth && !isAuthenticated) {
     next('/login')
   } else if (to.meta.requiresGuest && isAuthenticated) {
-    next('/')
+    next('/devices')
   } else {
     next()
   }

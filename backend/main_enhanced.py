@@ -1,4 +1,15 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    status,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    UploadFile,
+    File,
+    Form,
+)
 from fastapi.responses import PlainTextResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,11 +19,15 @@ from typing import List, Optional, Dict, Any
 import subprocess
 import re
 import json
+import os
+import tempfile
+import posixpath
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
 import logging
 import threading
+import time
 
 # Import our modules
 from database import get_db, create_tables, Device as DBDevice, User as DBUser, DeviceUsageLog as DBDeviceUsageLog, SessionLocal
@@ -315,37 +330,197 @@ def parse_mount_output(mount_output: str) -> Dict[str, Dict[str, Any]]:
     return mounts
 
 
-def parse_version_output(version_output: str) -> Dict[str, Optional[str]]:
-    """Parse ql-getversion output to extract host and cabin versions."""
-    normalized: Dict[str, Optional[str]] = {
-        "host": None,
-        "host_starflash": None,
-        "cabin": None,
-        "cabin_starflash": None,
+def _parse_int(value: str) -> Optional[int]:
+    """Convert numeric strings that may include commas into integers."""
+    if value is None:
+        return None
+    stripped = value.replace(',', '').strip()
+    if not stripped:
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        return None
+
+
+def _parse_percent(value: str) -> Optional[float]:
+    """Parse percentage strings such as '45%' into float values."""
+    if value is None:
+        return None
+    stripped = value.strip().rstrip('%')
+    if not stripped:
+        return None
+    try:
+        return float(stripped)
+    except ValueError:
+        return None
+
+
+def parse_df_output(df_output: str) -> Optional[Dict[str, Any]]:
+    """Parse `df` command output (single path) into structured usage details."""
+    if not df_output:
+        return None
+
+    data_lines = []
+    for raw_line in df_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("filesystem"):
+            continue
+        data_lines.append(line)
+
+    if not data_lines:
+        return None
+
+    last_line = data_lines[-1]
+    parts = re.split(r"\s+", last_line)
+    if len(parts) < 6:
+        return None
+
+    filesystem = parts[0]
+    size_kb = _parse_int(parts[-5])
+    used_kb = _parse_int(parts[-4])
+    available_kb = _parse_int(parts[-3])
+    used_percent = _parse_percent(parts[-2])
+    mounted_on = parts[-1]
+
+    used_ratio = None
+    if size_kb and used_kb is not None and size_kb > 0:
+        used_ratio = used_kb / size_kb
+
+    return {
+        "filesystem": filesystem,
+        "mounted_on": mounted_on,
+        "size_kb": size_kb,
+        "used_kb": used_kb,
+        "available_kb": available_kb,
+        "used_percent": used_percent,
+        "used_ratio": used_ratio,
+        "raw_line": last_line,
     }
 
-    keyword_mapping = {
-        "host": ["host", "主机"],
-        "host_starflash": ["host starflash", "主机星闪", "host-starflash", "host star flash", "主机星閃"],
-        "cabin": ["cabin", "座舱", "cockpit"],
-        "cabin_starflash": ["cabin starflash", "座舱星闪", "cabin-starflash", "座舱星閃", "cockpit starflash"],
+
+def collect_path_usage(device_id: str, paths: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Gather filesystem usage statistics for the given paths via `adb df`."""
+    usage: Dict[str, Dict[str, Any]] = {}
+
+    for path in paths:
+        cmd = ["adb", "-s", device_id, "shell", "df", "-k", path]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError) as exc:
+            usage[path] = {
+                "path": path,
+                "success": False,
+                "error": str(exc),
+                "raw_output": None,
+            }
+            continue
+
+        parsed = parse_df_output(result.stdout)
+        if parsed:
+            used_percent = parsed.get("used_percent")
+            if used_percent is None:
+                size_kb = parsed.get("size_kb")
+                used_kb = parsed.get("used_kb")
+                if size_kb and used_kb is not None and size_kb > 0:
+                    parsed["used_percent"] = (used_kb / size_kb) * 100
+
+            usage[path] = {
+                "path": path,
+                "success": True,
+                **parsed,
+                "raw_output": result.stdout,
+            }
+        else:
+            error_message = result.stderr.strip() or "Unable to parse df output"
+            usage[path] = {
+                "path": path,
+                "success": False,
+                "error": error_message,
+                "raw_output": result.stdout,
+            }
+
+    return usage
+
+
+def parse_version_output(version_output: str) -> Dict[str, Any]:
+    """Parse ql-getversion output into structured build/module versions."""
+
+    build_info: Dict[str, Optional[str]] = {
+        "version": None,
+        "build_time": None,
+        "hostname": None,
+        "commit": None,
+        "branch": None,
     }
+
+    module_versions: Dict[str, Optional[str]] = {
+        "camera_soc": None,
+        "camera_mcu": None,
+        "cabin_soc": None,
+        "cabin_mcu": None,
+    }
+
+    ic_version: Optional[str] = None
+    in_build_section = False
 
     for raw_line in version_output.splitlines():
         line = raw_line.strip()
         if not line:
             continue
 
-        parts = re.split(r"[:：]", line, maxsplit=1)
-        if len(parts) != 2:
+        lower_line = line.lower()
+
+        if "build info start" in lower_line:
+            in_build_section = True
+            continue
+        if "build info end" in lower_line:
+            in_build_section = False
             continue
 
-        key, value = parts[0].strip().lower(), parts[1].strip()
+        if in_build_section:
+            match = re.search(r"build info\s+(?P<key>\w+)\s*(?P<value>.+)", line, re.IGNORECASE)
+            if match:
+                key = match.group("key").lower()
+                value = match.group("value").strip() or None
+                if key in build_info:
+                    build_info[key] = value
+            continue
 
-        for field, keywords in keyword_mapping.items():
-            if any(keyword in key for keyword in keywords):
-                normalized[field] = value or None
-                break
+        if "geticversion" in lower_line and "version" in lower_line:
+            matches = re.findall(r"version[:：]\s*([^,\s]+)", line, re.IGNORECASE)
+            if matches:
+                ic_version = matches[-1].strip() or None
+            continue
+
+        if "getallversion" in lower_line and "version:" in lower_line:
+            version_str = line.rsplit("version:", 1)[1]
+            for pair in version_str.split(','):
+                key, _, value = pair.partition(':')
+                key = key.strip().lower()
+                value = value.strip() or None
+                if key in module_versions:
+                    module_versions[key] = value
+            continue
+
+    if not module_versions.get("camera_mcu") and ic_version:
+        module_versions["camera_mcu"] = ic_version
+
+    normalized: Dict[str, Any] = {
+        "host": module_versions.get("camera_soc") or build_info.get("version"),
+        "host_starflash": module_versions.get("camera_mcu"),
+        "cabin": module_versions.get("cabin_soc"),
+        "cabin_starflash": module_versions.get("cabin_mcu"),
+        "build_info": {k: v for k, v in build_info.items() if v},
+        "module_versions": module_versions,
+    }
 
     return normalized
 
@@ -513,6 +688,8 @@ def update_devices_in_db():
 @app.on_event("startup")
 async def startup_event():
     """Initialize resources when the application starts."""
+    global scheduler
+
     create_tables()
     loop = asyncio.get_running_loop()
     app.state.event_loop = loop
@@ -520,8 +697,17 @@ async def startup_event():
     # Run an immediate device scan without blocking the event loop
     await loop.run_in_executor(None, update_devices_in_db)
 
+    if scheduler is None:
+        scheduler = BackgroundScheduler()
+
     if not scheduler.running:
-        scheduler.add_job(update_devices_in_db, "interval", seconds=30, id="device_monitor", replace_existing=True)
+        scheduler.add_job(
+            update_devices_in_db,
+            "interval",
+            seconds=30,
+            id="device_monitor",
+            replace_existing=True,
+        )
         scheduler.start()
 
 
@@ -887,42 +1073,48 @@ def bluetooth_connect(
         raise HTTPException(status_code=400, detail="Device is not a Bluetooth device")
     
     try:
-        # Get connection info to find ADB host
         connection_info = json.loads(device.connection_info) if device.connection_info else {}
         adb_host = connection_info.get("adb_host")
-        
+
         if not adb_host:
             raise HTTPException(status_code=400, detail="No ADB host found for this Bluetooth device")
-        
-        # Execute bluetooth connect command
+
         cmd = ["adb", "-s", adb_host, "shell", "bluetoothctl", "connect", device_id]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        
-        # Log the action
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        combined = stdout or stderr
+
+        message = "Bluetooth connect command sent successfully"
+        if result.returncode != 0:
+            lower_combined = combined.lower()
+            if "already" in lower_combined:
+                message = "Bluetooth device is already connecting or connected"
+            else:
+                error_detail = combined or "Unknown error"
+                raise HTTPException(status_code=500, detail=f"Bluetooth connect failed: {error_detail}")
+
         log = DBDeviceUsageLog(
             device_id=device.id,
             user_id=current_user.id,
             action="bluetooth_connect",
-            notes=f"Bluetooth connect command executed: {' '.join(cmd)}"
+            notes=f"Bluetooth connect command executed: {' '.join(cmd)} | stdout: {stdout} | stderr: {stderr}"
         )
         db.add(log)
         db.commit()
-        
-        # Trigger device scan to update status
+
         update_devices_in_db()
-        
+
         return {
-            "message": "Bluetooth connect command sent successfully",
-            "output": result.stdout,
+            "message": message,
+            "output": stdout,
+            "error_output": stderr,
             "command": ' '.join(cmd)
         }
-        
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Bluetooth connect failed: {e.stderr}"
-        )
+
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/devices/{device_id}/bluetooth/disconnect")
@@ -939,42 +1131,42 @@ def bluetooth_disconnect(
         raise HTTPException(status_code=400, detail="Device is not a Bluetooth device")
     
     try:
-        # Get connection info to find ADB host
         connection_info = json.loads(device.connection_info) if device.connection_info else {}
         adb_host = connection_info.get("adb_host")
-        
+
         if not adb_host:
             raise HTTPException(status_code=400, detail="No ADB host found for this Bluetooth device")
-        
-        # Execute bluetooth disconnect command
+
         cmd = ["adb", "-s", adb_host, "shell", "bluetoothctl", "disconnect", device_id]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        
-        # Log the action
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+
+        if result.returncode != 0:
+            error_detail = stdout or stderr or "Unknown error"
+            raise HTTPException(status_code=500, detail=f"Bluetooth disconnect failed: {error_detail}")
+
         log = DBDeviceUsageLog(
             device_id=device.id,
             user_id=current_user.id,
             action="bluetooth_disconnect",
-            notes=f"Bluetooth disconnect command executed: {' '.join(cmd)}"
+            notes=f"Bluetooth disconnect command executed: {' '.join(cmd)} | stdout: {stdout} | stderr: {stderr}"
         )
         db.add(log)
         db.commit()
-        
-        # Trigger device scan to update status
+
         update_devices_in_db()
-        
+
         return {
             "message": "Bluetooth disconnect command sent successfully",
-            "output": result.stdout,
+            "output": stdout,
+            "error_output": stderr,
             "command": ' '.join(cmd)
         }
-        
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Bluetooth disconnect failed: {e.stderr}"
-        )
+
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/devices/{device_id}/bluetooth/pair")
@@ -991,42 +1183,48 @@ def bluetooth_pair(
         raise HTTPException(status_code=400, detail="Device is not a Bluetooth device")
     
     try:
-        # Get connection info to find ADB host
         connection_info = json.loads(device.connection_info) if device.connection_info else {}
         adb_host = connection_info.get("adb_host")
-        
+
         if not adb_host:
             raise HTTPException(status_code=400, detail="No ADB host found for this Bluetooth device")
-        
-        # Execute bluetooth pair command
+
         cmd = ["adb", "-s", adb_host, "shell", "bluetoothctl", "pair", device_id]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        
-        # Log the action
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        combined = stdout or stderr
+
+        message = "Bluetooth pair command sent successfully"
+        if result.returncode != 0:
+            lower_combined = combined.lower()
+            if "already" in lower_combined:
+                message = "Bluetooth device already paired"
+            else:
+                error_detail = combined or "Unknown error"
+                raise HTTPException(status_code=500, detail=f"Bluetooth pair failed: {error_detail}")
+
         log = DBDeviceUsageLog(
             device_id=device.id,
             user_id=current_user.id,
             action="bluetooth_pair",
-            notes=f"Bluetooth pair command executed: {' '.join(cmd)}"
+            notes=f"Bluetooth pair command executed: {' '.join(cmd)} | stdout: {stdout} | stderr: {stderr}"
         )
         db.add(log)
         db.commit()
-        
-        # Trigger device scan to update status
+
         update_devices_in_db()
-        
+
         return {
-            "message": "Bluetooth pair command sent successfully",
-            "output": result.stdout,
+            "message": message,
+            "output": stdout,
+            "error_output": stderr,
             "command": ' '.join(cmd)
         }
-        
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Bluetooth pair failed: {e.stderr}"
-        )
+
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/devices/{device_id}/bluetooth/info")
@@ -1090,23 +1288,44 @@ def get_device_mounts(
     if device.device_type != "adb":
         raise HTTPException(status_code=400, detail="Filesystem inspection is only supported for ADB devices")
 
+    adb_cmd = ["adb", "-s", device_id, "shell", "mount"]
     try:
         result = subprocess.run(
-            ["adb", "-s", device_id, "shell", "mount"],
+            adb_cmd,
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        error_message = getattr(exc, "stderr", None) or str(exc)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to execute mount command: {str(exc)}")
+
+    if result.returncode != 0 and result.returncode == 255:
+        subprocess.run(
+            ["adb", "-s", device_id, "wait-for-device"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        time.sleep(0.5)
+        result = subprocess.run(
+            adb_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    if result.returncode != 0:
+        error_message = result.stderr.strip() or result.stdout.strip() or f"adb exited with code {result.returncode}"
         raise HTTPException(status_code=500, detail=f"Failed to execute mount command: {error_message}")
 
     mounts = parse_mount_output(result.stdout)
-    mount_points = ["/", "/data/zhuimi"]
+    mount_points = ["/", "/data", "/data/zhuimi"]
+    usage_map = collect_path_usage(device_id, mount_points)
     mount_details = []
 
     for mount_point in mount_points:
         entry = mounts.get(mount_point)
+        usage_entry = usage_map.get(mount_point)
         mount_details.append({
             "mount_point": mount_point,
             "found": entry is not None,
@@ -1114,6 +1333,7 @@ def get_device_mounts(
             "fstype": entry.get("fstype") if entry else None,
             "options": entry.get("options") if entry else [],
             "writable": bool(entry.get("writable")) if entry else False,
+            "usage": usage_entry,
         })
 
     zhuimi_info = next((item for item in mount_details if item["mount_point"] == "/data/zhuimi"), None)
@@ -1121,6 +1341,7 @@ def get_device_mounts(
     return {
         "device_id": device_id,
         "mounts": mount_details,
+        "path_usage": list(usage_map.values()),
         "zhuimi_writable": zhuimi_info.get("writable") if zhuimi_info else False,
         "raw_output": result.stdout,
     }
@@ -1160,6 +1381,93 @@ def get_device_versions(
     }
 
 
+@app.post("/api/devices/{device_id}/filesystem/push")
+async def push_file_to_device(
+    device_id: str,
+    file: UploadFile = File(...),
+    remote_dir: str = Form("/data"),
+    remote_filename: Optional[str] = Form(None),
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a file from the API host to the device via ADB push."""
+    device = db.query(DBDevice).filter(DBDevice.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if device.device_type != "adb":
+        raise HTTPException(status_code=400, detail="File push is only supported for ADB devices")
+
+    if device.status not in {"online", "occupied"}:
+        raise HTTPException(status_code=400, detail="Device must be online to receive files")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file must include a filename")
+
+    try:
+        contents = await file.read()
+    except Exception as exc:  # pragma: no cover - defensive read guard
+        raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {exc}")
+
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    target_dir = (remote_dir or "/data").strip() or "/data"
+    if not target_dir.startswith("/"):
+        raise HTTPException(status_code=400, detail="Remote directory must be an absolute path")
+
+    filename = remote_filename.strip() if remote_filename else file.filename
+    filename = os.path.basename(filename)
+    if not filename:
+        raise HTTPException(status_code=400, detail="Remote filename cannot be empty")
+
+    remote_path = posixpath.join(target_dir.rstrip("/"), filename)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(contents)
+            tmp.flush()
+            tmp_path = tmp.name
+
+        result = subprocess.run(
+            ["adb", "-s", device_id, "push", tmp_path, remote_path],
+            capture_output=True,
+            text=True,
+        )
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        combined = stdout or stderr
+
+        if result.returncode != 0:
+            error_detail = combined or "Unknown error"
+            raise HTTPException(status_code=500, detail=f"ADB push failed: {error_detail}")
+
+        log = DBDeviceUsageLog(
+            device_id=device.id,
+            user_id=current_user.id,
+            action="filesystem_push",
+            notes=f"Pushed {filename} to {remote_path} ({len(contents)} bytes)",
+        )
+        db.add(log)
+        db.commit()
+
+        return {
+            "message": "File pushed successfully",
+            "remote_path": remote_path,
+            "command": f"adb -s {device_id} push <uploaded> {remote_path}",
+            "output": stdout,
+        }
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 @app.get("/api/devices/{device_id}/logs/fastapi")
 def download_fastapi_log(
     device_id: str,
@@ -1174,30 +1482,52 @@ def download_fastapi_log(
     if device.device_type != "adb":
         raise HTTPException(status_code=400, detail="Log retrieval is only supported for ADB devices")
 
-    try:
+    log_paths = [
+        "/tmp/log_FastCGIServer.log",
+    ]
+
+    stdout = ""
+    stderr = ""
+    selected_path = None
+    error_state: Optional[HTTPException] = None
+
+    for log_path in log_paths:
         result = subprocess.run(
-            ["adb", "-s", device_id, "shell", "cat", "/tmp/log_FastAPI.log"],
+            ["adb", "-s", device_id, "shell", "cat", log_path],
             capture_output=True,
             text=True,
-            check=True,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        error_message = getattr(exc, "stderr", None) or str(exc)
-        raise HTTPException(status_code=500, detail=f"Failed to read log file: {error_message}")
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        combined = stdout or stderr
+
+        if result.returncode == 0:
+            selected_path = log_path
+            break
+
+        lower_combined = combined.lower()
+        if "no such file" in lower_combined or "not found" in lower_combined:
+            error_state = HTTPException(status_code=404, detail=f"FastAPI log file not found on device at {log_path}")
+        else:
+            error_state = HTTPException(status_code=500, detail=f"Failed to read log file {log_path}: {combined or 'Unknown error'}")
+
+    if not selected_path:
+        raise error_state or HTTPException(status_code=500, detail="Failed to read FastAPI log from device")
 
     log_entry = DBDeviceUsageLog(
         device_id=device.id,
         user_id=current_user.id,
         action="download_fastapi_log",
-        notes="Downloaded /tmp/log_FastAPI.log via API",
+        notes=f"Downloaded {selected_path} via API",
     )
     db.add(log_entry)
     db.commit()
 
-    filename = f"{device_id}_log_FastAPI.log"
+    filename = f"{device_id}_log_FastCGIServer.log"
 
     return PlainTextResponse(
-        result.stdout,
+        stdout,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"'
         }

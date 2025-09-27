@@ -232,6 +232,46 @@
 
           <el-table :data="filesystemInfo ? filesystemInfo.mounts : []" size="small">
             <el-table-column prop="mount_point" label="挂载点" width="160" />
+            <el-table-column label="实际挂载点" width="160">
+              <template #default="{ row }">
+                <span>{{ row.usage?.mounted_on || '-' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="容量" width="120">
+              <template #default="{ row }">
+                <span v-if="row.usage?.success">{{ formatCapacity(row.usage.size_kb) }}</span>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="已用" width="120">
+              <template #default="{ row }">
+                <span v-if="row.usage?.success">{{ formatCapacity(row.usage.used_kb) }}</span>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="可用" width="120">
+              <template #default="{ row }">
+                <span v-if="row.usage?.success">{{ formatCapacity(row.usage.available_kb) }}</span>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="占用率" width="180">
+              <template #default="{ row }">
+                <template v-if="row.usage?.success">
+                  <div class="usage-cell">
+                    <el-progress
+                      v-if="getUsagePercentage(row.usage) != null"
+                      :percentage="Number(getUsagePercentage(row.usage).toFixed(1))"
+                      :stroke-width="12"
+                      :show-text="false"
+                    />
+                    <span class="usage-text">{{ formatPercent(getUsagePercentage(row.usage)) }}</span>
+                  </div>
+                </template>
+                <span v-else-if="row.usage?.error" class="text-muted">{{ row.usage.error }}</span>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
             <el-table-column prop="source" label="来源" width="200">
               <template #default="{ row }">
                 <span>{{ row.source || '-' }}</span>
@@ -329,7 +369,7 @@
             </el-button>
           </div>
         </div>
-        <p class="card-description">当前仅支持一键拉取 /tmp/log_FastAPI.log。</p>
+        <p class="card-description">当前仅支持一键拉取 /tmp/log_FastCGIServer.log。</p>
       </div>
 
       <!-- Usage Logs -->
@@ -533,7 +573,56 @@ export default {
       }
       return types[type] || 'info'
     }
-    
+
+    const formatCapacity = (sizeKb) => {
+      if (sizeKb == null || Number.isNaN(sizeKb)) {
+        return '-'
+      }
+
+      const units = ['KB', 'MB', 'GB', 'TB', 'PB']
+      let value = sizeKb
+      let unitIndex = 0
+
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024
+        unitIndex += 1
+      }
+
+      const formatted = value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2)
+      return `${formatted} ${units[unitIndex]}`
+    }
+
+    const formatPercent = (percent) => {
+      if (percent == null || Number.isNaN(percent)) {
+        return '-'
+      }
+
+      const value = Number(percent)
+      if (value >= 100) {
+        return `${value.toFixed(0)}%`
+      }
+      if (value >= 10) {
+        return `${value.toFixed(1)}%`
+      }
+      return `${value.toFixed(2)}%`
+    }
+
+    const getUsagePercentage = (usage) => {
+      if (!usage || !usage.success) {
+        return null
+      }
+
+      const percent = usage.used_percent != null
+        ? usage.used_percent
+        : (usage.used_ratio != null ? usage.used_ratio * 100 : null)
+
+      if (percent == null || Number.isNaN(percent)) {
+        return null
+      }
+
+      return Math.min(100, Math.max(0, percent))
+    }
+
     const getStatusLabel = (status) => {
       const labels = {
         'online': '在线',
@@ -640,7 +729,7 @@ export default {
         const response = await deviceAPI.downloadFastApiLog(deviceId.value)
         const contentType = response.headers['content-type'] || 'text/plain'
         const blob = new Blob([response.data], { type: contentType })
-        let filename = `${deviceId.value}_log_FastAPI.log`
+        let filename = `${deviceId.value}_log_FastCGIServer.log`
         const disposition = response.headers['content-disposition']
         if (disposition) {
           const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i)
@@ -776,6 +865,9 @@ export default {
       getDeviceTypeTagType,
       getStatusLabel,
       getStatusTagType,
+      formatCapacity,
+      formatPercent,
+      getUsagePercentage,
       formatTime,
       getUsageDuration,
       ArrowLeft,
@@ -892,6 +984,22 @@ export default {
 
 .mount-options {
   word-break: break-all;
+}
+
+.usage-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.usage-cell .el-progress {
+  flex: 1;
+}
+
+.usage-text {
+  min-width: 48px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .text-muted {

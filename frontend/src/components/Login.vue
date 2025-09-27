@@ -26,7 +26,6 @@
             placeholder="密码"
             size="large"
             :prefix-icon="Lock"
-            @keyup.enter="handleLogin"
           />
         </el-form-item>
         
@@ -35,7 +34,7 @@
             type="primary" 
             size="large" 
             :loading="loading"
-            @click="handleLogin"
+            native-type="submit"
             style="width: 100%"
           >
             {{ loading ? '登录中...' : '登录' }}

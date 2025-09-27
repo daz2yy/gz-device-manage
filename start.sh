@@ -72,7 +72,7 @@ kill_by_pid_file() {
 # Function to stop services
 stop_services() {
     log "Stopping Device Management System services..."
-    
+
     kill_by_pid_file "$BACKEND_PID_FILE" "Backend"
     kill_by_pid_file "$FRONTEND_PID_FILE" "Frontend"
     
@@ -86,8 +86,21 @@ stop_services() {
         log_warning "Force stopping frontend on port 5173..."
         lsof -ti:5173 | xargs kill -9 2>/dev/null || true
     fi
-    
+
     log_success "All services stopped"
+}
+
+stop_frontend_service() {
+    log "Stopping frontend service..."
+
+    kill_by_pid_file "$FRONTEND_PID_FILE" "Frontend"
+
+    if check_port 5173; then
+        log_warning "Force stopping frontend on port 5173..."
+        lsof -ti:5173 | xargs kill -9 2>/dev/null || true
+    fi
+
+    log_success "Frontend service stopped"
 }
 
 # Function to check dependencies
@@ -120,6 +133,23 @@ check_dependencies() {
     fi
     
     log_success "Dependencies check completed"
+    return 0
+}
+
+check_frontend_only_dependencies() {
+    log "Checking frontend dependencies..."
+
+    if ! command -v node &> /dev/null; then
+        log_error "Node.js is not installed"
+        return 1
+    fi
+
+    if ! command -v npm &> /dev/null; then
+        log_error "npm is not installed"
+        return 1
+    fi
+
+    log_success "Frontend dependencies check completed"
     return 0
 }
 
@@ -366,21 +396,65 @@ main() {
             install_frontend_deps
             log_success "All dependencies installed"
             ;;
+        "start-frontend")
+            log "🚀 Starting frontend service..."
+            echo "=================================================="
+
+            if ! check_frontend_only_dependencies; then
+                exit 1
+            fi
+
+            stop_frontend_service
+
+            if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
+                install_frontend_deps || exit 1
+            fi
+
+            if start_frontend; then
+                log_success "🎉 Frontend service started successfully!"
+                log "Press Ctrl+C to stop frontend service"
+
+                trap 'stop_frontend_service; exit 0' INT TERM
+
+                while true; do
+                    sleep 10
+
+                    if [ -f "$FRONTEND_PID_FILE" ]; then
+                        local frontend_pid=$(cat "$FRONTEND_PID_FILE")
+                        if ! kill -0 $frontend_pid 2>/dev/null; then
+                            log_error "Frontend service died unexpectedly"
+                            break
+                        fi
+                    else
+                        log_error "Frontend PID file not found; assuming service stopped"
+                        break
+                    fi
+                done
+
+                stop_frontend_service
+                exit 1
+            else
+                log_error "Failed to start frontend service"
+                exit 1
+            fi
+            ;;
         *)
-            echo "Usage: $0 {start|stop|restart|status|logs|install}"
+            echo "Usage: $0 {start|stop|restart|status|logs|install|start-frontend}"
             echo ""
             echo "Commands:"
-            echo "  start    - Start both backend and frontend services"
-            echo "  stop     - Stop all services"
-            echo "  restart  - Restart all services"
-            echo "  status   - Show service status"
-            echo "  logs     - Show logs (backend|frontend)"
-            echo "  install  - Install all dependencies"
+            echo "  start           - Start both backend and frontend services"
+            echo "  stop            - Stop all services"
+            echo "  restart         - Restart all services"
+            echo "  status          - Show service status"
+            echo "  logs            - Show logs (backend|frontend)"
+            echo "  install         - Install all dependencies"
+            echo "  start-frontend  - Start only the frontend service"
             echo ""
             echo "Examples:"
             echo "  $0 start"
             echo "  $0 logs backend"
             echo "  $0 logs frontend"
+            echo "  $0 start-frontend"
             exit 1
             ;;
     esac

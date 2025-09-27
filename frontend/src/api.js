@@ -1,57 +1,86 @@
 import axios from 'axios'
 
-const api = axios.create({
-  baseURL: '/api',
-  timeout: 10000
-})
+const env = import.meta.env
 
-// Request interceptor to add auth token
-api.interceptors.request.use(
-  config => {
-    const token = localStorage.getItem('token')
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`
-    }
-    return config
-  },
-  error => {
-    return Promise.reject(error)
+const normalizeBaseUrl = (value) => {
+  if (!value) return ''
+  return value.replace(/\/+$/, '')
+}
+
+const normalizePrefix = (value, fallback) => {
+  if (value === undefined) {
+    return fallback
   }
-)
-
-// Response interceptor to handle auth errors
-api.interceptors.response.use(
-  response => response,
-  error => {
-    if (error.response?.status === 401) {
-      localStorage.removeItem('token')
-      localStorage.removeItem('user')
-      window.location.href = '/login'
-    }
-    return Promise.reject(error)
+  if (!value) {
+    return ''
   }
-)
+  return value.startsWith('/') ? value : `/${value}`
+}
 
-// Create separate auth API instance for auth endpoints
-const authApiInstance = axios.create({
-  baseURL: '/',
+const joinBaseAndPrefix = (base, prefix) => {
+  if (!base) {
+    return prefix || ''
+  }
+  return `${base}${prefix || ''}`
+}
+
+const backendBaseUrl = normalizeBaseUrl(env.VITE_BACKEND_BASE_URL ?? (env.DEV ? 'http://localhost:8001' : ''))
+const apiPrefix = normalizePrefix(env.VITE_BACKEND_API_PREFIX, '/api')
+const authPrefix = normalizePrefix(env.VITE_BACKEND_AUTH_PREFIX, '/auth')
+
+const apiBaseURL = joinBaseAndPrefix(backendBaseUrl, apiPrefix)
+const authBaseURL = joinBaseAndPrefix(backendBaseUrl, authPrefix)
+
+const attachInterceptors = (instance) => {
+  instance.interceptors.request.use(
+    (config) => {
+      const token = localStorage.getItem('token')
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`
+      }
+      return config
+    },
+    (error) => Promise.reject(error)
+  )
+
+  instance.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (error.response?.status === 401) {
+        localStorage.removeItem('token')
+        localStorage.removeItem('user')
+        window.location.href = '/login'
+      }
+      return Promise.reject(error)
+    }
+  )
+
+  return instance
+}
+
+const api = attachInterceptors(axios.create({
+  baseURL: apiBaseURL,
   timeout: 10000
-})
+}))
+
+const authApiInstance = attachInterceptors(axios.create({
+  baseURL: authBaseURL,
+  timeout: 10000
+}))
 
 // Auth API
 export const authAPI = {
   login: (username, password) => {
-    const formData = new FormData()
+    const formData = new URLSearchParams()
     formData.append('username', username)
     formData.append('password', password)
-    return authApiInstance.post('/auth/login', formData)
-  },
-  register: (userData) => authApiInstance.post('/auth/register', userData),
-  getMe: () => {
-    const token = localStorage.getItem('token')
-    return authApiInstance.get('/auth/me', {
-      headers: { Authorization: `Bearer ${token}` }
+    return authApiInstance.post('/login', formData, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     })
+  },
+  register: (userData) => authApiInstance.post('/register', userData),
+  getMe: () => {
+    return authApiInstance.get('/me')
   }
 }
 

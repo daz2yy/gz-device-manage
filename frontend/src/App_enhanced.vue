@@ -14,8 +14,9 @@
             mode="horizontal"
             router
             class="main-nav"
+            :ellipsis="false"
           >
-            <el-menu-item index="/">
+            <el-menu-item index="/dashboard">
               <el-icon><Monitor /></el-icon>
               <span>仪表盘</span>
             </el-menu-item>
@@ -119,7 +120,7 @@ export default {
       router.push('/login')
       ElMessage.success('已退出登录')
     }
-    
+
     const initializeAuth = async () => {
       if (store.token) {
         try {
@@ -291,10 +292,6 @@ body {
   
   .logo {
     font-size: 16px;
-  }
-  
-  .main-nav .el-menu-item span {
-    display: none;
   }
   
   .username {
